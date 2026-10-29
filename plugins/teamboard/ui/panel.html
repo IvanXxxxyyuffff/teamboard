@@ -1268,7 +1268,7 @@ function shellMode(m){                 // home / board / card
   const on = m==="board";
   document.querySelector("header.topbar").style.display = on?"":"none";
   document.querySelector("main").style.display = on?"":"none";
-  if(m==="home"&&!HOME_T) HOME_T=setInterval(()=>{ if(HOMED) loadHome(); },8000);
+  if(m==="home"&&!HOME_T) HOME_T=setInterval(()=>{ if(HOMED) loadHome(); },4000);
 }
 function showHome(on){ shellMode(on?"home":"board"); }
 function goHome(){ showHome(true); loadHome(); }
@@ -1325,7 +1325,7 @@ async function boot(){
     showHome(true); await loadHome();
   }
   if(PID) await refresh();
-  setInterval(()=>{ if(!HOMED) refresh(); },3000);
+  setInterval(()=>{ if(!HOMED) refresh(); },2000);
   if(q.get("view")) setView(q.get("view"));
   const ap=q.get("approval");
   if(ap){ const a=await api("GET","/api/approvals/"+ap).catch(()=>null); if(a&&a.id) openApproval(a); }
@@ -1951,7 +1951,7 @@ function teamRender(){
         ${m.blocked_count&&m.state!=="blocked"?`<div class="now" style="color:var(--coral)" title="${esc(m.blocked_reason||"总监没写卡点原因")}">⛔ ${esc(m.blocked_count>1?`${m.blocked_count} 条阻塞 · ${m.blocked_title}`:m.blocked_title)}</div>`:""}
         <div class="r tline${m.state!=="working"?" off":""}">${
           m.state==="working"?`计时 ${fmtDur(m.time_running)} · 累计 ${fmtDur(m.time_total)}`
-          :`摸鱼 ${m.away_for>=0?fmtDur(m.away_for):"—"}${m.time_total?` · 累计 ${fmtDur(m.time_total)}`:""}`
+          :(`${m.state==="stale"?"停摆 ":"摸鱼 "}${m.away_for>=0?fmtDur(m.away_for):"—"}${m.time_total?` · 累计 ${fmtDur(m.time_total)}`:""}`)
         }${m.state!=="working"?"":(m.heartbeat_age>=0
           ?` <span class="hb"${m.stale?" data-stale=\"1\"":""}>· 心跳 ${fmtDur(m.heartbeat_age)} 前</span>`
           :` <span class="hb" data-stale="1">· 无心跳</span>`)}</div>

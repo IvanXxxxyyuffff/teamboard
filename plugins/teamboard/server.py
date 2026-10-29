@@ -1316,9 +1316,50 @@ SESS_ROOT = os.environ.get("TEAMBOARD_SESSIONS") or os.path.expanduser("~/.codex
 _THREAD_CACHE = {"at": 0.0, "rows": []}
 _LIVE_CACHE = {"at": 0.0, "map": {}, "sig": None}
 SESSION_LIVE_WINDOW = HEARTBEAT_WINDOW   # 与会话/心跳同一个窗口，别让两个时钟互相打架
+# 事件流里的「这一轮结束了」。Codex 退出时补的是 turn_aborted，
+# 正常收工补的是 task_complete——两种都不是「还在干活」。
+TERMINAL_EVENTS = {"task_complete", "turn_aborted"}
+_TAIL_CACHE = {}
 
 
-def session_mtimes(ttl=12, days=2):
+def session_tail(path):
+    """读 rollout 尾部最后一条事件（类型 / 时间）。
+
+    只看 mtime 会被「退出时补一笔」骗到：14:56 关掉 Codex，文件 mtime 变成 14:56，
+    接下来 5 分钟整个团队都显示「工作中」，其实一个都没在跑。
+    """
+    if not path:
+        return {}
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    key = (st.st_size, int(st.st_mtime))
+    hit = _TAIL_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    info = {}
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, st.st_size - 20000))
+            lines = f.read().decode("utf-8", "ignore").strip().splitlines()
+        for ln in reversed(lines):
+            try:
+                d = json.loads(ln)
+            except Exception:                       # noqa: BLE001
+                continue
+            pl = d.get("payload") or {}
+            info = {"type": (pl.get("type") if isinstance(pl, dict) else "") or d.get("type", ""),
+                    "ts": d.get("timestamp", ""),
+                    "reason": (pl.get("reason") if isinstance(pl, dict) else "") or ""}
+            break
+    except OSError:
+        info = {}
+    _TAIL_CACHE[path] = (key, info)
+    return info
+
+
+def session_mtimes(ttl=2, days=2):
     """会话文件 mtime 索引（thread_id → 最后一次写入时间）。
 
     子代理跑在 Codex 里，不会主动回调心跳，所以「有没有人干活」不能只看 last_seen。
@@ -1338,6 +1379,7 @@ def session_mtimes(ttl=12, days=2):
     if now - _LIVE_CACHE["at"] < ttl and _LIVE_CACHE.get("sig") == sig:
         return _LIVE_CACHE["map"]
     out = {}
+    paths = {}
     for d in dirs:
         for p in glob.glob(os.path.join(d, "*.jsonl")):
             try:
@@ -1349,6 +1391,7 @@ def session_mtimes(ttl=12, days=2):
             if m:
                 full = m.group(1)
                 out[full] = max(out.get(full, 0.0), mt)
+                paths[full] = p
     # 成员表里 thread_id 有的存全量 UUID、有的只存前 8 位（工位绑定用短 id），
     # 两种都要能查到；前缀键取同名会话里最新的一次写入。
     # 注意：前缀只是「查询便利」，不能当成「这个工位还活着」的证据——
@@ -1358,7 +1401,8 @@ def session_mtimes(ttl=12, days=2):
         short = k[:8]
         if out.get(short, 0.0) < out[k]:
             out[short] = out[k]
-    _LIVE_CACHE.update({"at": now, "map": out, "full": full_keys, "sig": sig})
+    _LIVE_CACHE.update({"at": now, "map": out, "full": full_keys, "sig": sig,
+                        "paths": paths})
     return out
 
 
@@ -1648,13 +1692,22 @@ def project_state(pid):
         sess_mt_full = sess_mt if (tid0 and tid0 in _LIVE_CACHE.get("full", ())) else 0.0
         m["session_age"] = max(0, int(now - sess_mt)) if sess_mt else -1
         m["session_live"] = bool(sess_mt_full) and (now - sess_mt_full) < SESSION_LIVE_WINDOW
+        # mtime 新 ≠ 有人在干：退出 Codex 时它会补一笔 turn_aborted / task_complete。
+        # 最后一笔是「收工」，这条会话此刻就没有在跑——不管 mtime 有多新。
+        if sess_mt_full:
+            tail = session_tail((_LIVE_CACHE.get("paths") or {}).get(tid0, ""))
+            if tail.get("type") in TERMINAL_EVENTS:
+                m["session_ended"] = tail["type"]
+                m["session_live"] = False
         # 宿主进程探活：Codex 一退出，子代理就再也不会有任何回调，
         # 只靠心跳/会话窗口会让看板继续显示「工作中」5~15 分钟。
         # 登记过 pid 的成员，进程没了就当场判死，不等窗口过期。
         hp = int(m.get("host_pid") or 0)
         alive = proc_alive(hp, m.get("host_boot") or "")
         m["host_alive"] = alive                  # None = 没登记 pid，无法判断
-        host_dead = (alive is False)             # 只在「确定死了」时降级，不猜
+        # Codex 重启后同一个会话会被新进程接着写，但库里还记着上一条 pid：
+        # 那是「记录过期」，不是「人没了」。会话这一秒还在写 = 活着，pid 只是参考。
+        host_dead = (alive is False) and not m["session_live"]
         m["live"] = (m["on_duty"] or m["session_live"]
                      or (beat > 0 and (now - beat) < HEARTBEAT_WINDOW))
         if host_dead:
@@ -1703,6 +1756,7 @@ def project_state(pid):
         # 否则总监会以为有人在盯这个卡点，其实是空的。
         blocked_dead = bool(blocked) and (
             host_dead
+            or bool(m.get("session_ended"))        # 会话最后一笔是收工/中断：没人守着了
             or (bool(sess_mt_full) and (now - sess_mt_full) > DOING_STALE_SEC)
             or (beat > 0 and (now - beat) > DOING_STALE_SEC))
         # 状态以「任务事实」为准：有 doing 任务就是工作中，心跳只用于判定空闲/离线。
@@ -2082,6 +2136,7 @@ def project_state(pid):
     # 「已开启 3 个子代理，看板只有 2 个工位」= 用户眼里的对不上。
     # 判定只认三条事实：跟本项目工位同一个父会话、10 分钟内还在写、没被任何项目登记。
     unseated = []
+    rebinds = []
     try:
         rows = scan_threads(days=2, limit=400)
         seat_ids = {m["thread_id"] for m in members if m.get("thread_id")}
@@ -2095,6 +2150,22 @@ def project_state(pid):
             if r.get("parent") not in mine_parents:      continue
             if r.get("id") in bound:                     continue
             if now - r.get("mtime", 0) > UNSEATED_LIVE_SEC: continue
+            # 收工了的不算「在跑」：退出时补的那笔也会刷新 mtime
+            tail = session_tail((_LIVE_CACHE.get("paths") or {}).get(r["id"], ""))
+            if tail.get("type") in TERMINAL_EVENTS:      continue
+            # 子代理被关掉又重开 = 一条新会话。工位还绑着旧会话，看板就会显示「摸鱼」，
+            # 而人明明在跑。会话开头（spawn 的 prompt）写了工位名，且该工位当前没有活会话
+            # → 让原员工接管这条新会话。只认「恰好一个」候选，认不准就晾着让人来定。
+            head = r.get("head") or ""
+            cands = [m for m in members
+                     if not m.get("is_lead") and m["name"] and m["name"] in head
+                     and not m["session_live"]]
+            if len(cands) == 1:
+                res = bind_member(pid, cands[0]["id"], r["id"],
+                                  reason="auto:新会话开头写了这个工位名")
+                if isinstance(res, dict) and not res.get("error"):
+                    rebinds.append({"member": cands[0]["name"], "thread": r["id"][:8]})
+                    continue
             unseated.append({"id": r["id"], "short": r["id"][:8],
                              "age_min": r.get("age_min", 0)})
     except Exception:                                     # noqa: BLE001
@@ -2135,6 +2206,7 @@ def project_state(pid):
             "pending_approvals": pending, "team_cap": TEAM_CAP,
             # 在跑却没落座的子代理：看板不能假装它们不存在，也不能假装它们在编
             "unseated": unseated,
+            "auto_bound": rebinds,
             "roles": role_rows, "milestones": milestones,
             "resource_conflicts": conflicts,
             "goal_violations": viol[:200],

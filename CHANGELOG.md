@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.4 — sync with the subagent, not with its timestamp
+
+The rollout file's mtime gets bumped by the event Codex appends *on the way out*
+(`turn_aborted`) and on a clean finish (`task_complete`). So a team that had just been
+shut down read "working" for the whole five-minute window. Liveness now reads the tail event:
+a terminal last event means the seat is done, whatever the mtime says; the next real event
+starts it again. Detection is event-level, not a guess about elapsed time.
+
+The session index cache drops from 12s to 2s (a full scan costs 0.2ms) and both UIs poll at
+2s, so start/stop is visible within about 3 seconds. A `blocked` seat whose executor has
+finished now reads `stale` instead of `blocked`.
+
+A subagent that is closed and reopened comes back under a **new** session id while the seat
+still points at the old one. When the new session's opening text names a seat that has no live
+session, that seat now takes the new session automatically (`auto_bound` in `project_state`,
+audited as `member.thread_moved`). One candidate only — no guessing when ambiguous.
+
 ## 0.3.3 — a blocked task is not a blocked person
 
 The state machine put `blocked` ahead of everything, so a seat with a blocked task read

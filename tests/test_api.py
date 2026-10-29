@@ -133,9 +133,10 @@ def main():
         check("the blocked reason survives the downgrade",
               "等用户确认" in (dead.get("stuck") or ""), dead.get("stuck"))
 
-        # 会话还在写 = 人在干活。blocked 是任务状态，不是人的状态：
-        # 实测 trigger_state / quest3_detector 每几秒写一次会话，却曾被画成「卡住·摸鱼中」
-        call(base, "POST", f"/api/members/{mem2['id']}/heartbeat", {"pid": os.getpid()})
+        # 会话还在写 = 人在干活，两件事都靠这一条：
+        #   ① blocked 是任务状态，不是人的状态（实测每几秒写一次会话却被画成「卡住·摸鱼中」）
+        #   ② Codex 重启后库里还留着上一条死 pid，但会话已经由新进程接着写——
+        #      pid 是记录过期，不是人没了。所以这里故意不刷新 pid，保持 999999 那条死记录。
         from datetime import datetime
         d = datetime.now()
         day = home / "sessions" / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
@@ -155,6 +156,32 @@ def main():
         check("the blocked title rides along on the member row",
               live.get("blocked_count") == 1 and live.get("blocked_title"),
               (live.get("blocked_count"), live.get("blocked_title")))
+        check("a resumed session outranks a stale host pid",
+              live.get("dead_reason") != "process", live.get("dead_reason"))
+
+        # 收工：Codex 退出/收尾时会补一笔 turn_aborted / task_complete。
+        # 那笔会把 mtime 刷成「刚刚」，但人已经不在跑了——只认事件，不认 mtime。
+        sess_file = day / f"rollout-2026-01-01T00-00-00-{tid}.jsonl"
+        with sess_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "event_msg",
+                                "payload": {"type": "turn_aborted"}}) + "\n")
+        os.utime(sess_file, None)          # 退出补的这笔同样会刷新 mtime
+        code, state = call(base, "GET", f"/api/projects/{pid}")
+        stopped = [x for x in state["members"] if x["id"] == mem2["id"]][0]
+        check("a terminal event stops the seat even with a fresh mtime",
+              stopped["state"] != "working"
+              and stopped.get("session_ended") == "turn_aborted",
+              (stopped["state"], stopped.get("session_ended")))
+
+        # 重新开工：再来一笔事件就得立刻回到工作中（不等人手动改状态）
+        with sess_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "event_msg",
+                                "payload": {"type": "token_count"}}) + "\n")
+        code, state = call(base, "GET", f"/api/projects/{pid}")
+        restarted = [x for x in state["members"] if x["id"] == mem2["id"]][0]
+        check("a new event starts the seat again",
+              restarted["state"] == "working" and not restarted.get("session_ended"),
+              (restarted["state"], restarted.get("session_ended")))
     finally:
         kill_board(base)
         try:

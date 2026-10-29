@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "teamboard",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "TeamBoard: an in-chat kanban for AI teams - who is working on what, how far along, and where it is stuck.",
   "author": {
     "name": "TeamBoard contributors"
