@@ -276,7 +276,19 @@ def main():
         code, freed = call(base, "PATCH", f"/api/tasks/{task['id']}",
                            {"progress": 40})
         check("the gate leaves a way out (task updates still work)", code == 200, freed)
+        # 模拟「Codex 刚退出」：补一笔收尾事件，mtime 是刚刚，但没人在跑。
+        # 这正是实测里看板报「全部对得上」的那个窗口。
+        with sess_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "event_msg",
+                                "payload": {"type": "turn_aborted"}}) + "\n")
         os.utime(sess_file, None)
+        time.sleep(2.2)
+        code, state = call(base, "GET", f"/api/projects/{pid}")
+        i = state.get("idle") or {}
+        # 刚断（App 重启补的收尾事件把 mtime 刷成「刚刚」）也要立刻亮：
+        # 只看 15 分钟阈值会在这段窗口里报「全部对得上」，实测踩过。
+        check("just-dropped team warns at once but does not gate yet",
+              i.get("warn") is True and i.get("alert") is False, i)
 
         # 自驱心跳：用户不说话时，谁来把这一轮重新拉起来
         code, lead = call(base, "POST", f"/api/projects/{pid}/members",

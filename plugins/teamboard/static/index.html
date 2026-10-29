@@ -750,17 +750,17 @@ function idleBanner(){
   if(!box) return;
   const I=S.idle||{}, A=S.autopilot||{};
   const rows=[];
-  if(I.alert){
+  if(I.warn){
     const who=(I.silent||[]).slice(0,4)
       .map(x=>`${esc(x.name)} ${x.silent>=0?dur(x.silent):"无会话"}`).join("　");
-    rows.push(`<div class="idleb bad">
-      <span>⚠ <b>全员停摆 ${esc(I.human)}</b>　${I.workers} 个员工里 0 个在干活，
+    // 刚断和断了很久是两件事：都亮，但只有后者会拦写操作
+    rows.push(`<div class="idleb ${I.alert?"bad":"warn"}">
+      <span>⚠ <b>${I.alert?`全员停摆 ${esc(I.human)}`:"0 个员工在干活"}</b>
+      　${I.workers} 个工位一个都没在跑${I.alert?"":`（最后一次动静 ${esc(I.human||"刚刚")}前）`}，
       手上还压着 <b>${I.open_tasks}</b> 条未收工</span>
       <span class="more" onclick="idleDetail()">谁停最久</span>
       <span class="who" id="idlewho" style="display:none">${who}</span>
     </div>`);
-  }else if(I.workers && I.working){
-    // 正常态不占地方，只在标题右边留一个数，别把屏幕塞满
   }
   if(!A.found){
     rows.push(`<div class="idleb warn">

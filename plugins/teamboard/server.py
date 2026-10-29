@@ -2646,7 +2646,15 @@ def project_state(pid):
             idle_sec, idle_reason = min(sils), "all_silent"
         else:
             idle_sec, idle_reason = None, "no_session_data"
-    idle_alert = bool(idle_sec and idle_sec >= IDLE_ALERT_SEC and open_n)
+    # 两级信号，别混成一个：
+    #   warn  = 一个人都没在干活（立刻亮，不管停了多久）
+    #   alert = 已经停了 15 分钟（硬闸，拦写操作）
+    # 只用 alert 会漏掉最关键的场景：Codex 刚重启，退出时补的 turn_aborted
+    # 把每条会话的 mtime 刷成「刚刚」，alert 要再等 15 分钟才亮；而此刻
+    # 4 个工位确实一个都没在跑，看板却报「全部对得上」。实测踩过。
+    idle_warn = bool(workers and open_n
+                     and not any(m["state"] == "working" for m in workers))
+    idle_alert = bool(idle_warn and (idle_sec or 0) >= IDLE_ALERT_SEC)
     # 自驱：用户不说话时，谁能把这一轮叫醒。没有心跳 = 项目只在你开口时才存在。
     lead_m = next((m for m in members if m.get("is_lead")), None)
     auto = automation_status((lead_m or {}).get("thread_id") or "")
@@ -2687,6 +2695,8 @@ def project_state(pid):
             "idle": {"sec": int(idle_sec) if idle_sec is not None else None,
                      "human": _hm(idle_sec) if idle_sec else "",
                      "reason": idle_reason,
+                     # warn = 0 人在干活（立刻）；alert = 已持续 15 分钟（硬闸）
+                     "warn": idle_warn,
                      "alert": idle_alert,
                      "threshold_sec": IDLE_ALERT_SEC,
                      "workers": len(workers),
@@ -3452,7 +3462,8 @@ def project_health(pid, st=None):
                 # 停摆必须排在最前面：它是唯一一条「整队都没在动」的结论，
                 # 其余几项都只是局部异常。
                 (f"全员停摆 {(st.get('idle') or {}).get('human', '')}"
-                 if (st.get("idle") or {}).get("alert") else ""),
+                 if (st.get("idle") or {}).get("alert") else
+                 ("0 人在干活" if (st.get("idle") or {}).get("warn") else "")),
                 ("没有自驱心跳，用户不出声项目就停"
                  if not (st.get("autopilot") or {}).get("ready") else ""),
                 f"{len(stale)} 个工位已静默" if stale else "",

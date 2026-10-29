@@ -118,11 +118,13 @@ def _idle_line(st):
     i = st.get("idle") or {}
     if not i.get("workers"):
         return "人：编制里一个员工都没有（只有你）。先 add_member，再谈进度。"
-    if i.get("alert"):
+    if i.get("warn"):
         names = "、".join(
             f"{x['name']}({fmt_dur(x['silent']) if (x.get('silent') or -1) >= 0 else '无会话'})"
             for x in (i.get("silent") or [])[:4])
-        return (f"⛔ 全员停摆 {i.get('human')}：{i['workers']} 个员工里 0 个在干活，"
+        head = (f"⛔ 全员停摆 {i.get('human')}" if i.get("alert")
+                else f"⚠ 0 个员工在干活（最后一次动静 {i.get('human') or '刚刚'}前）")
+        return (f"{head}：{i['workers']} 个工位一个都没在跑，"
                 f"手上还压着 {i.get('open_tasks')} 条未收工。{names}。"
                 f"→ 先派活（update_task 认领 + member_duty 分工），再干别的。")
     return (f"人在干活：{i.get('working')}/{i['workers']} 个员工在跑，"

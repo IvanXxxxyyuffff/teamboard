@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.9 — "0 working" must never read as "all fine"
+
+`idle` is now two signals instead of one. `warn` means nobody on the team is working and
+tasks are open — it lights immediately. `alert` means that has lasted 15 minutes — it is the
+hard gate on `propose_plan` / `add_member` / report export.
+
+Splitting them fixes the exact window that made the board lie right after a restart: Codex
+appends a `turn_aborted` to every session on exit, which bumps mtime to "just now". Four seats,
+zero working, and the board reported `全部对得上` for another fifteen minutes. Measured
+2026-10-29 22:38 on the live project.
+
+The panel banner follows `warn`: amber while the drop is fresh ("0 个员工在干活 · 最后一次动静
+N 分钟前"), red once the gate is armed ("全员停摆 N 分钟"). `health.summary` and the first line
+of `project_status` say the same thing in the same words.
+
 ## 0.3.8 — the team that stops without saying so
 
 The real failure mode was never "hard task". It was **four workers idle and nobody noticing**.
