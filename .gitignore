@@ -1,0 +1,17 @@
+# generated at install time (absolute paths are machine specific)
+plugins/teamboard/.mcp.json
+# runtime data
+*.db
+*.db-wal
+*.db-shm
+server.log
+.teamboard/
+__pycache__/
+*.pyc
+# local artifacts
+preview-*.png
+*.bak*
+.DS_Store
+
+# local scratch
+_trash/

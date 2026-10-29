@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "teamboard": {
+      "command": "__PYTHON__",
+      "args": ["__PLUGIN_DIR__/mcp_server.py"],
+      "env": { "TEAMBOARD_HOME": "__HOME__" },
+      "enabled": true
+    }
+  }
+}

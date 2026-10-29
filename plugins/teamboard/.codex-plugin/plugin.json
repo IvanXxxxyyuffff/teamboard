@@ -1,0 +1,28 @@
+{
+  "name": "teamboard",
+  "version": "0.2.0",
+  "description": "TeamBoard: an in-chat kanban for AI teams - who is working on what, how far along, and where it is stuck.",
+  "author": {
+    "name": "TeamBoard contributors"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/<owner>/teamboard",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "TeamBoard",
+    "shortDescription": "Team / members / tasks / progress in one panel",
+    "longDescription": "Open an inline team panel: every team you are running, who is on it, what each member is doing right now, progress, blockers and deadlines. Starting a team goes through a plan-approval step (5 members max by default).",
+    "developerName": "TeamBoard contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "logo": "./assets/logo.svg",
+    "composerIcon": "./assets/logo.svg",
+    "defaultPrompt": [
+      "Open the team panel and show me what everyone is working on"
+    ]
+  }
+}

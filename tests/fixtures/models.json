@@ -1,0 +1,12 @@
+{
+  "models": [
+    {"slug": "gpt-test-large", "display_name": "GPT Test Large", "visibility": "list",
+     "default_reasoning_level": "medium",
+     "supported_reasoning_levels": [{"effort": "low", "description": "fast"},
+                                    {"effort": "medium", "description": "balanced"},
+                                    {"effort": "high", "description": "deep"}]},
+    {"slug": "gpt-test-mini", "display_name": "GPT Test Mini", "visibility": "list",
+     "default_reasoning_level": "low",
+     "supported_reasoning_levels": [{"effort": "low", "description": "fast"}]}
+  ]
+}

@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: manifests match VERSION
+        run: |
+          python scripts/sync_version.py
+          git diff --exit-code plugins/teamboard/plugin.json plugins/teamboard/.codex-plugin/plugin.json
+      - name: board API contract
+        run: python tests/test_api.py
+      - name: mcp stdio contract (boots its own board)
+        run: python tests/test_mcp_stdio.py

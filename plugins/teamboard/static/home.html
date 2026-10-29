@@ -1,0 +1,175 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>TeamBoard · 全部项目</title>
+<link rel="stylesheet" href="/theme.css" />
+<style>
+  .topbar{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:26px;
+    padding:14px 28px;border-bottom:1px solid var(--line);
+    background:rgba(9,11,13,.72);backdrop-filter:blur(20px) saturate(150%)}
+  .ro-pill{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--ink-3);
+    border:1px dashed var(--line-2);border-radius:999px;padding:6px 11px;margin-left:auto;margin-right:14px}
+  .brand{display:flex;align-items:center;gap:10px;flex:0 0 auto}
+  .mark{position:relative;width:26px;height:26px;border-radius:8px;
+    background:linear-gradient(150deg,var(--lime) 8%,#84b51c 52%,#3f6f18);
+    box-shadow:0 2px 14px -3px var(--glow)}
+  .mark::after{content:"";position:absolute;inset:8px;border-radius:2px;background:#0b0e08}
+  .bt b{display:block;font-size:14px;font-weight:700;letter-spacing:-.015em;color:var(--ink-1);line-height:1.2}
+  .bt i{display:block;font-style:normal;font-size:9px;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-4)}
+  .stats{display:flex;align-items:center;gap:26px;margin-left:auto}
+  .stat b{display:block;font-size:17px;font-weight:750;line-height:1.1;color:var(--ink-1);
+    letter-spacing:-.045em;font-variant-numeric:tabular-nums}
+  .stat span{font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-4)}
+  .stat+.stat{padding-left:26px;border-left:1px solid var(--line)}
+
+  .wrap{position:relative;z-index:1;max-width:1360px;margin:0 auto;padding:46px 28px 90px}
+  .pagehead{display:flex;align-items:flex-end;justify-content:space-between;gap:30px;margin-bottom:30px}
+  h1{font-size:clamp(30px,4vw,44px);letter-spacing:-.05em;line-height:1.02;margin-top:12px;font-weight:800}
+  h1 em{font-style:normal;color:var(--lime)}
+  .lede{max-width:34ch;color:var(--ink-3);font-size:12.5px;line-height:1.7;text-align:right}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}
+
+  .card{position:relative;display:flex;flex-direction:column;padding:22px 22px 18px;border:1px solid var(--line);
+    border-radius:22px;cursor:pointer;overflow:hidden;
+    background:linear-gradient(180deg,rgba(255,255,255,.055),rgba(255,255,255,.018));
+    box-shadow:0 1px 0 rgba(255,255,255,.05) inset,0 26px 60px -46px #000;
+    transition:transform .22s cubic-bezier(.2,.7,.3,1),box-shadow .26s,border-color .26s}
+  .card::after{content:"";position:absolute;inset:-1px -1px auto -1px;height:1px;
+    background:linear-gradient(90deg,transparent,rgba(204,245,86,.55),transparent);opacity:0;transition:opacity .3s}
+  .card:hover{transform:translateY(-4px);border-color:rgba(204,245,86,.28);
+    box-shadow:0 1px 0 rgba(255,255,255,.09) inset,0 40px 80px -44px rgba(0,0,0,.95),0 0 0 1px rgba(204,245,86,.06)}
+  .card:hover::after{opacity:1}
+  .card:hover .go{color:var(--lime);transform:translateX(3px)}
+  .hd{display:flex;align-items:flex-start;gap:12px}
+  .hd h3{font-size:16.5px;line-height:1.3;letter-spacing:-.025em;min-width:0;font-weight:700}
+  .dl{flex:0 0 auto;margin-left:auto;font-size:10px;font-weight:650;color:var(--ink-3);
+    background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:999px;padding:5px 10px;white-space:nowrap;
+    font-variant-numeric:tabular-nums}
+  .goal{margin:10px 0 22px;font-size:12.5px;line-height:1.65;color:var(--ink-3);text-wrap:pretty;
+    display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;min-height:41px}
+  .pl{display:flex;align-items:baseline;gap:10px;margin-bottom:12px}
+  .pl .n{font-size:38px;font-weight:800;line-height:.9;color:var(--ink-1);letter-spacing:-.06em;font-variant-numeric:tabular-nums}
+  .pl .n small{font-size:14px;font-weight:650;color:var(--ink-3);letter-spacing:0;margin-left:2px}
+  .pl .sub{margin-left:auto;font-size:11px;color:var(--ink-3);font-variant-numeric:tabular-nums}
+  .segs{display:flex;gap:3px;height:7px;margin-bottom:16px}
+  .segs i{display:block;height:100%;border-radius:3px;min-width:2px;transition:flex .4s}
+  .s-done{background:var(--mint)} .s-doing{background:var(--lime)} .s-review{background:var(--violet)}
+  .s-blocked{background:var(--coral)} .s-backlog{background:rgba(255,255,255,.16)}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:18px}
+  .ft{display:flex;align-items:center;gap:10px;margin-top:auto;padding-top:14px;border-top:1px solid var(--line)}
+  .ft .roles{white-space:nowrap}
+  .avs{display:flex;gap:5px}
+  .av{width:28px;height:28px;margin-left:0;border-radius:50%;display:grid;place-items:center;
+    font-size:11px;font-weight:800;color:#0b0d0a;letter-spacing:-.02em;border:2px solid #0c0e11;box-shadow:0 0 0 1px rgba(255,255,255,.14)}
+  .av.off{opacity:.45}
+  .roles{font-size:11px;color:var(--ink-3)}
+  .go{margin-left:auto;font-size:11.5px;font-weight:650;color:var(--ink-3);transition:transform .18s,color .18s}
+  .empty{grid-column:1/-1;padding:74px 24px;text-align:center;color:var(--ink-3);font-size:13px;
+    background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.012));
+    border:1px dashed var(--line-2);border-radius:22px}
+  .empty b{display:block;color:var(--ink-1);font-size:15.5px;margin-bottom:7px;letter-spacing:-.02em;font-weight:700}
+
+  @media (max-width:900px){
+    .topbar{flex-wrap:wrap;gap:12px;padding:12px 18px}
+    .stats{width:100%;order:3;gap:0;justify-content:space-between;margin-left:0}
+    .stat+.stat{padding-left:0;border-left:0}
+    .topbar>.btn{order:2;margin-left:auto}
+    .wrap{padding:30px 18px 64px}
+    .pagehead{flex-direction:column;align-items:flex-start;gap:12px}
+    .lede{text-align:left}
+    .grid{grid-template-columns:1fr}
+  }
+  @media (max-width:520px){
+    .stat b{font-size:15px}
+    .card{padding:18px 16px 15px}
+    .pl .n{font-size:33px}
+  }
+</style>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/"><span class="mark"></span><span class="bt"><b>TeamBoard</b><i>team workspace</i></span></a>
+  <div class="stats">
+    <div class="stat"><b id="s-proj">0</b><span>项目</span></div>
+    <div class="stat"><b id="s-task">0</b><span>任务</span></div>
+    <div class="stat"><b id="s-mem">0</b><span>成员</span></div>
+    <div class="stat"><b id="s-prog">0%</b><span>平均进度</span></div>
+  </div>
+  <span class="ro-pill">只读视图</span>
+</header>
+
+<main class="wrap">
+  <div class="pagehead">
+    <div><span class="eyebrow">projects</span><h1>全部<em>项目</em></h1></div>
+    <p class="lede">每个项目一套班子 —— 谁在做、做到哪、卡在哪，一眼看完。</p>
+  </div>
+  <div class="grid" id="grid"></div>
+</main>
+
+<script>
+const COLORS=["#ccf556","#4fe3a3","#b6a3ff","#6ec8ff","#f5c04a","#ff9f7d","#8fe0d0","#e0c2ff"];
+const colorOf=n=>COLORS[[...String(n)].reduce((a,c)=>a+c.charCodeAt(0),0)%COLORS.length];
+const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const seg=(k,n)=>n>0?`<i class="s-${k}" style="flex:${n}"></i>`:"";
+
+async function load(){
+  const d=await fetch("/api/overview").then(r=>r.json());
+  document.getElementById("s-proj").textContent=d.agg.projects;
+  document.getElementById("s-task").textContent=d.agg.tasks;
+  document.getElementById("s-mem").textContent=d.agg.members;
+  document.getElementById("s-prog").textContent=d.agg.overall+"%";
+
+  const g=document.getElementById("grid");
+  if(!d.projects.length){
+    g.innerHTML='<div class="empty"><b>还没有项目</b>让项目总监建一个，再回到这里看进度</div>';return;
+  }
+  g.innerHTML=d.projects.map(p=>{
+    const s=p.stats;
+    const avs=p.members.slice(0,5).map(m=>
+      `<div class="av ${m.state==='offline'?'off':''}" style="background:${colorOf(m.name)}"
+         title="${esc(m.name)} · ${esc(m.role)}">${esc(m.name[0])}</div>`).join("");
+    return `<div class="card" onclick="location.href='/board?pid=${p.id}'">
+      <div class="hd"><h3>${esc(p.name)}</h3>
+        ${p.deadline_ts?`<span class="dl" data-cts="${p.deadline_ts}"
+          title="截止 ${esc(p.deadline)} · 时间已用 ${p.time_used_pct??"?"}%">${cdText(p.deadline_ts)}</span>`
+          :(p.deadline?`<span class="dl">${esc(p.deadline)}</span>`:"")}</div>
+      <div class="goal">${esc(p.goal||"（未填写目标）")}</div>
+      <div class="pl"><span class="n">${s.overall}<small>%</small></span>
+        <span class="sub">完成 ${s.done}/${s.total} · 交付物 ${s.delivered}/${s.deliverables}</span></div>
+      <div class="segs">${seg("done",s.done)}${seg("doing",s.doing)}${seg("review",s.review)}${seg("blocked",s.blocked)}${seg("backlog",s.backlog)}</div>
+      <div class="chips">
+        <span class="chip doing"><span class="d"></span>进行中<b>${s.doing}</b></span>
+        <span class="chip review"><span class="d"></span>待验收<b>${s.review}</b></span>
+        <span class="chip blocked"><span class="d"></span>阻塞<b>${s.blocked}</b></span>
+        <span class="chip done"><span class="d"></span>完成<b>${s.done}</b></span>
+      </div>
+      <div class="ft"><div class="avs">${avs}</div>
+        <span class="roles">${(()=>{
+          // 人和任务数是两件事：人数看成员表，别拿「岗位字符串」去数人头（同一个岗位会被拆成多条）
+          const crew=(p.members||[]).length;
+          return `${crew} 人 · ${s.total} 任务`;
+        })()}</span>
+        <span class="go">打开看板 →</span></div>
+    </div>`;
+  }).join("");
+  tickCd();
+}
+
+/* 首页卡片上的倒计时：和服务端同一个 deadline_ts，本地每秒走字 */
+const p2p=n=>String(n).padStart(2,"0");
+function cdText(ts){
+  const ms=Math.round(ts*1000-Date.now()), over=ms<0; let r=Math.abs(ms);
+  const d=Math.floor(r/86400000); r-=d*86400000;
+  const h=Math.floor(r/3600000); r-=h*3600000;
+  const m=Math.floor(r/60000);  r-=m*60000;
+  return (over?"逾期 ":"剩 ")+(d>0?d+"d "+p2p(h)+":"+p2p(m):p2p(h)+":"+p2p(m)+":"+p2p(Math.floor(r/1000)));
+}
+function tickCd(){document.querySelectorAll("[data-cts]").forEach(el=>{
+  const ts=Number(el.dataset.cts); if(ts) el.textContent=cdText(ts);});}
+setInterval(tickCd,1000);
+load(); setInterval(load,5000);
+</script>
+</body>
+</html>
