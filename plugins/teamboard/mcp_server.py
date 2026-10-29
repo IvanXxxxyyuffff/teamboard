@@ -432,6 +432,9 @@ def call(name, args):
             tail = ""
             if x["state"] == "working":
                 tail = "在岗"
+            elif x["state"] == "blocked":
+                # 阻塞的人在不在岗不重要，重要的是他卡在哪——别拿「断了 0 秒」糊弄
+                tail = "卡住"
             else:
                 tail = (x.get("dead_why") or "不在岗") + (f" · 已断 {x['gone_human']}"
                                                           if x["gone_for"] >= 0 else "")
