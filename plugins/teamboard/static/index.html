@@ -1342,9 +1342,10 @@ function teamRender(){
     <div class="mem${m.is_lead?" lead":""}" onclick="openMember('${m.id}')" title="点开看他在做什么、卡在哪">
       <div class="big" style="background:${colorOf(m.name)}">${esc(m.name[0])}</div>
       <div class="info">
-        <div class="n">${esc(m.name)}<span class="badge ${m.state}" title="${esc(STATE_TIP[m.state]||"")}">${stateText(m)}</span>
+        <div class="n">${esc(m.agent_leaf||m.name)}<span class="badge ${m.state}" title="${esc(STATE_TIP[m.state]||"")}">${stateText(m)}</span>
           <span class="load${m.overload&&!m.is_lead?" hot":""}" title="${m.is_lead?`总监手里还有 ${m.load} 条未收工任务（总监不占执行并发槽，这里是提醒别再往它身上压活）`:(m.overload?`手里 ${m.load} 条活，并发槽只有 ${m.capacity}：活压在一个人身上，排期会失真`:`${m.load} 条任务 / ${m.capacity} 个并发槽`)}">${m.is_lead?`${m.load} 条在手`:`${m.load}/${m.capacity}`}${m.overload&&!m.is_lead?" 超载":""}</span></div>
-        <div class="r">${esc(m.role)}${m.kind==="agent"?" · AI 子代理":""}</div>
+        <div class="r">${esc(m.role)}${m.kind==="agent"?" · AI 子代理":""}${
+          m.agent_leaf?`　· 工位 ${esc(m.name)}${m.agent_nickname?`（${esc(m.agent_nickname)}）`:""}`:""}</div>
         ${m.kind==="agent"?`<div class="r" style="margin-top:4px">${m.model
           ? `<code>${esc(m.model)}</code>${m.effort?` <span class="badge">${esc(m.effort)}</span>`:""}`
           : `<span class="badge" style="border-style:dashed">跟随会话模型</span>`}</div>`:""}

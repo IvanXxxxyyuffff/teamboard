@@ -295,6 +295,11 @@ def init_db():
             ("members", "model_actual", "TEXT DEFAULT ''"),
             ("members", "duty_until", "REAL DEFAULT 0"),
             ("members", "thread_id", "TEXT DEFAULT ''"),   # Codex 会话 id：点击员工能跳过去看他做什么
+            # 会话自报的身份（session_meta → payload.source.subagent.thread_spawn）。
+            # 工位号只是座位，agent_path 才是「这一轮是谁在干」——两者分开，
+            # 「看板上写张三、实际跑的是李四」在结构上就不可能发生。
+            ("members", "agent_path", "TEXT DEFAULT ''"),
+            ("members", "agent_nickname", "TEXT DEFAULT ''"),
             # 员工编制：工位号是「人」的稳定身份，会话只是临时坐进来执行的那一段
             ("members", "seat_no", "INTEGER DEFAULT 0"),       # 工位号，发出去就不再变
             ("members", "roster_state", "TEXT DEFAULT 'active'"),  # active / vacant / swapping
@@ -1325,6 +1330,16 @@ SESS_ROOT = os.environ.get("TEAMBOARD_SESSIONS") or os.path.expanduser("~/.codex
 _THREAD_CACHE = {"at": 0.0, "rows": []}
 _LIVE_CACHE = {"at": 0.0, "map": {}, "sig": None}
 SESSION_LIVE_WINDOW = HEARTBEAT_WINDOW   # 与会话/心跳同一个窗口，别让两个时钟互相打架
+# 「在写」和「还活着」是两件事。Codex 的 rollout 每几秒就落一笔 token_count /
+# reasoning / function_call_output，真在跑的子代理**不可能** 90 秒一笔都不落。
+# 用 300s 的宽窗口判「在写」，会让已经收工/被 429 打死的会话多亮 5 分钟「工作中」
+# （实测 2026-10-29：18:23 起的三个子代理 21:00 全部结束后仍显示工作中）。
+# 所以存活判定用短窗：90 秒无新事件 = 这条会话此刻不在跑。
+SESSION_SILENT_SEC = 90
+# 索引覆盖的天数。只扫 2 天会漏掉「三天前开的、一直在写」的长会话——主线程
+# 恰好就是这种：文件在 10-27 的目录里，写到今天，于是永远查不到、永远显示离线。
+SESSION_INDEX_DAYS = 10
+_AGENT_CACHE = {}
 # 事件流里的「这一轮结束了」。Codex 退出时补的是 turn_aborted，
 # 正常收工补的是 task_complete——两种都不是「还在干活」。
 TERMINAL_EVENTS = {"task_complete", "turn_aborted"}
@@ -1385,11 +1400,69 @@ def session_tail(path):
     return info
 
 
-def session_mtimes(ttl=2, days=2):
+def agent_info(path):
+    """会话头的身份字段：agent_path = /root/quest10_device，nickname = Copernicus。
+
+    Codex 在 session_meta 里就写好了这两项（payload.source.subagent.thread_spawn）。
+    它是「谁在这个会话里干活」的权威答案——比让总监在 prompt 里手写工位名可靠：
+    名字对不上这件事在结构上就不会发生。只读头部 8KB。
+    """
+    if not path:
+        return {}
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    key = (st.st_size, int(st.st_mtime))
+    hit = _AGENT_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    info = {"agent_path": "", "agent_nickname": "", "depth": 0, "subagent": False}
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8192).decode("utf-8", "ignore")
+        m = re.search(r'"agent_path"\s*:\s*"([^"]*)"', head)
+        if m:
+            info["agent_path"] = m.group(1)[:120]
+        m = re.search(r'"agent_nickname"\s*:\s*"([^"]*)"', head)
+        if m:
+            info["agent_nickname"] = m.group(1)[:60]
+        m = re.search(r'"depth"\s*:\s*(\d+)', head)
+        if m:
+            info["depth"] = int(m.group(1))
+        info["subagent"] = '"subagent"' in head[:4000]
+    except OSError:
+        pass
+    _AGENT_CACHE[path] = (key, info)
+    return info
+
+
+def session_path_of(tid):
+    """thread_id → rollout 文件绝对路径。索引还没扫到新会话时直接 glob 兜底。"""
+    tid = (tid or "").strip()
+    if not tid:
+        return ""
+    p = (_LIVE_CACHE.get("paths") or {}).get(tid)
+    if p and os.path.exists(p):
+        return p
+    hits = glob.glob(os.path.join(SESS_ROOT, "*", "*", "*", f"*-{tid}.jsonl"))
+    if not hits:
+        return ""
+    try:
+        return max(hits, key=os.path.getmtime)
+    except OSError:
+        return hits[0]
+
+
+def session_mtimes(ttl=2, days=10):
     """会话文件 mtime 索引（thread_id → 最后一次写入时间）。
 
     子代理跑在 Codex 里，不会主动回调心跳，所以「有没有人干活」不能只看 last_seen。
-    这里只 glob 最近两天的日期目录、只取 mtime、不读内容，12 秒缓存，成本可忽略。
+    这里 glob 最近 10 天的日期目录、只取 mtime、不读内容，2 秒缓存，成本可忽略。
+
+    WHY 从 2 天改到 10 天（2026-10-29 实测）：主线程的会话是 10-27 开的，一直写到今天。
+    只扫最近两天 → 这个会话根本不在索引里 → 工位静默时长恒为 -1 → 正在干活的总监被画成
+    「离线」。绑定的是全 UUID、文件也确实在写，坏的是索引范围，不是人。
     """
     now = time.time()
     # 目录 mtime 变了（新开了一个子代理 → 新出现一个 rollout 文件）就立刻重扫，
@@ -1717,7 +1790,17 @@ def project_state(pid):
         # 存活只认全量 UUID 的写入时间（前缀命中不算数，见 session_mtimes 的说明）
         sess_mt_full = sess_mt if (tid0 and tid0 in _LIVE_CACHE.get("full", ())) else 0.0
         m["session_age"] = max(0, int(now - sess_mt)) if sess_mt else -1
-        m["session_live"] = bool(sess_mt_full) and (now - sess_mt_full) < SESSION_LIVE_WINDOW
+        m["session_live"] = bool(sess_mt_full) and (now - sess_mt_full) < SESSION_SILENT_SEC
+        # 静默时长单独记一份：前端可以画「静默 3 分钟」，而不是把断线的座位画成在干活
+        m["session_silent"] = (max(0, int(now - sess_mt_full)) if sess_mt_full else -1)
+        # 会话自报的身份：agent_path 才是「这一轮谁在干」，姓名只是座位招牌。
+        # 放在这里实时解析（有 mtime 缓存，读到就复用），不写库——写库会变成
+        # 每个轮询周期 5 次 UPDATE，而这两项本来就是会话的属性，不是人的属性。
+        ap = agent_info((_LIVE_CACHE.get("paths") or {}).get(tid0, "")) if tid0 else {}
+        m["agent_path"] = ap.get("agent_path") or ""
+        m["agent_nickname"] = ap.get("agent_nickname") or ""
+        m["agent_leaf"] = (m["agent_path"].rstrip("/").split("/")[-1]
+                           if m["agent_path"] else "")
         # mtime 新 ≠ 有人在干：退出 Codex 时它会补一笔 turn_aborted / task_complete。
         # 最后一笔是「收工」，这条会话此刻就没有在跑——不管 mtime 有多新。
         # 而且「写了文件」也只证明写过：重启补的 session_meta、用户发消息写的
@@ -1793,7 +1876,11 @@ def project_state(pid):
         # 阻塞也要有人守着：任务标了 blocked，但执行体早断了，那就不叫「卡住」，
         # 叫「僵住」——卡点是任务写的，僵住是人没了。这两件事必须分开显示，
         # 否则总监会以为有人在盯这个卡点，其实是空的。
-        blocked_dead = bool(blocked) and (
+        # 「僵住」的前提是「真的没人在跑」。会话这一秒还在写（reasoning / token_count）
+        # 就说明人在干活——哪怕心跳停在两小时前、任务还挂着 blocked。
+        # 不加 not session_live 的话，会用心跳把正在写会话的活人判死（实测 quest3_detector：
+        # tail=reasoning、静默 0 秒，state 却是「僵住」，state_source=task+stale）。
+        blocked_dead = bool(blocked) and not m["session_live"] and (
             host_dead
             or bool(m.get("session_ended"))        # 会话最后一笔是收工/中断：没人守着了
             or (bool(sess_mt_full) and (now - sess_mt_full) > DOING_STALE_SEC)
@@ -2420,9 +2507,18 @@ def bind_member(pid, mid, thread_id, reason="", host_pid=0, host_boot=""):
                       (thread_id, now, binds + 1, now, mid))
         log_event(c, pid, "member.rebind", actor=mid,
                   payload=f"工位#{int(m['seat_no'] or 0)} {old or '(空)'} → {thread_id}")
+    # 换会话即换名：身份跟着会话走，不消耗一次人事审批——改的是「这一轮谁坐这把椅子」，
+    # 不是「编制里多了一个人」。名字对不上从此不可能发生，因为名字是会话自己报的。
+    ap = agent_info(session_path_of(thread_id))
+    if ap.get("agent_path"):
+        with db() as c:
+            c.execute("UPDATE members SET agent_path=?, agent_nickname=? WHERE id=?",
+                      (ap["agent_path"], ap.get("agent_nickname", ""), mid))
     return {"ok": True, "id": mid, "name": m["name"], "thread_id": thread_id,
             "seat_no": int(m["seat_no"] or 0), "bind_count": binds + 1,
-            "prev_thread": old}
+            "prev_thread": old,
+            "agent_path": ap.get("agent_path", ""),
+            "agent_nickname": ap.get("agent_nickname", "")}
 
 
 def find_member(pid, ref):
@@ -2929,6 +3025,61 @@ DEAD_WHY = {"process": "宿主进程已退出（Codex 关了）",
             "heartbeat": "长时间没有心跳"}
 
 
+def project_health(pid, st=None):
+    """一个接口回答「哪里对不上」：静默、掉线、空工位、无主任务。
+
+    三处判断（面板、board_overview、总监自查）读同一份数字，
+    否则总监每轮开局都要拿 list_agents 和看板手工比对，永远比不完。
+    """
+    st = st or project_state(pid)
+    if not st:
+        return None
+    now = time.time()
+    stale, vacant, orphan_tasks, unseated = [], [], [], st.get("unseated") or []
+    silent_min = -1
+    for m in st["members"]:
+        sil = int(m.get("session_silent") or -1)
+        if sil >= 0:
+            silent_min = sil if silent_min < 0 else min(silent_min, sil)
+        doing = [t for t in st["tasks"]
+                 if t["assignee_id"] == m["id"] and t["status"] == "doing"]
+        # 掉线：有活没干完，但会话已经静默。90 秒前它还算「在干活」，
+        # 现在必须由这个字段把窗口压下来——不然要等 15 分钟才变「僵住」。
+        if m["state"] == "stale" and doing:
+            stale.append({"seat": m.get("seat_label"), "name": m["name"],
+                          "agent": m.get("agent_leaf") or "",
+                          "silent_sec": sil, "state": m["state"],
+                          "doing": doing[0]["title"], "doing_id": doing[0]["id"]})
+        # 空工位：会话死够久、手上又没活。这是陈述事实，不是撤编，不消耗审批。
+        dead_for = (now - float(m.get("last_alive") or 0)) if m.get("last_alive") else -1
+        if (not doing and not m.get("is_lead") and m["state"] in ("offline", "stale")
+                and dead_for > 2 * 3600):
+            vacant.append({"seat": m.get("seat_label"), "name": m["name"],
+                           "agent": m.get("agent_leaf") or "",
+                           "dead_human": _hm(int(dead_for))})
+    for t in st["tasks"]:
+        if t["status"] != "doing":
+            continue
+        who = next((x for x in st["members"] if x["id"] == t["assignee_id"]), None)
+        if who is None or who["state"] not in ("working", "blocked"):
+            orphan_tasks.append({"id": t["id"], "title": t["title"],
+                                 "assignee": (who or {}).get("name", "—"),
+                                 "state": (who or {}).get("state", "no-owner")})
+    return {"project_id": pid, "name": st["project"].get("name", ""),
+            "generated_at": now_iso(),
+            "silent_sec": silent_min,
+            "stale": stale, "vacant": vacant, "unseated": unseated,
+            "orphan_tasks": orphan_tasks,
+            "counts": {"members": len(st["members"]), "stale": len(stale),
+                       "vacant": len(vacant), "unseated": len(unseated),
+                       "orphan_tasks": len(orphan_tasks)},
+            "summary": " · ".join(filter(None, [
+                f"{len(stale)} 个工位已静默" if stale else "",
+                f"{len(orphan_tasks)} 条任务无主" if orphan_tasks else "",
+                f"{len(unseated)} 个会话没登记工位" if unseated else "",
+                f"{len(vacant)} 个空工位" if vacant else ""])) or "全部对得上"}
+
+
 def resume_brief(pid):
     """交班简报：新会话开工前，总监必须先看这一份。
 
@@ -2956,6 +3107,9 @@ def resume_brief(pid):
                    for t in doing}
         team.append({
             "id": m["id"], "seat": m.get("seat_label"), "name": m["name"],
+            # 会话自报的身份：换人接手时，这两个字段比工位名更能说明「谁在干」
+            "agent": m.get("agent_leaf") or "", "nickname": m.get("agent_nickname") or "",
+            "silent_sec": m.get("session_silent", -1),
             "role": m.get("role", ""), "state": m["state"],
             "state_source": m.get("state_source", ""),
             "dead_reason": m.get("dead_reason", ""),
@@ -3231,6 +3385,7 @@ def overview():
         # 批准后任务落库，卡片自然回来。
         if not st["tasks"] and not st["members"] and not (st.get("pending_approvals") or []):
             continue
+        hl = project_health(p["id"], st)
         out.append({
             "id": p["id"], "name": p["name"], "goal": p.get("goal", ""),
             "lead": p.get("lead", ""), "deadline": p.get("deadline", ""),
@@ -3255,6 +3410,8 @@ def overview():
             "resume": st.get("resume"),
             # 在跑但没落座的会话：首页就该喊，不然总监根本不知道有人在白跑
             "unseated": st.get("unseated") or [],
+            # 一句话说清「哪里对不上」：面板和 board_overview 读同一份数字
+            "health": {"summary": hl["summary"], "counts": hl["counts"]},
             "members": [{"id": m["id"], "name": m["name"], "role": m["role"],
                          "state": m["state"], "kind": m["kind"], "progress": m["progress"],
                          "current_task": m["current_task"],
@@ -3550,6 +3707,10 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/projects/([\w]+)/resume-brief", p)
         if m:
             r = resume_brief(m.group(1))
+            return self._send(200 if r else 404, r or {"error": "no such project"})
+        m = re.fullmatch(r"/api/projects/([\w]+)/health", p)
+        if m:
+            r = project_health(m.group(1))
             return self._send(200 if r else 404, r or {"error": "no such project"})
         m = re.fullmatch(r"/api/projects/([\w]+)", p)
         if m:

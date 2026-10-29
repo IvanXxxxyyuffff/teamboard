@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.7 — identity comes from the session, not the prompt
+
+`s​ession_meta` already carries `payload.source.subagent.thread_spawn.{agent_path,
+agent_nickname}`. The board now reads the first 8KB and uses it as the primary name —
+`quest10_device (Copernicus) · seat battle_srv` — with the hand-written seat name demoted to
+a subtitle. Renaming on rebind costs no approval, because what changed is which session sits
+in the chair, not the roster. "The board says one name, the agent runs under another" is now
+structurally impossible: the name is reported by the session itself.
+
+Two constants were making the board lie. `SESSION_LIVE_WINDOW` (300s) kept stopped
+subagents lit as "working" for five minutes; liveness now uses `SESSION_SILENT_SEC = 90`.
+The session index only covered two days, so a thread opened three days ago and still being
+written today was simply invisible (`silent = -1` → permanently offline); it now covers ten.
+
+`blocked_dead` also required nothing of `session_live`, so a live session with an old
+heartbeat was ruled dead (measured: `tail=reasoning`, silence 0s, state "stalled"). It now
+requires `not session_live` first.
+
+`GET /api/projects/<pid>/health` returns `{silent_sec, stale[], vacant[], unseated[],
+orphan_tasks[], summary}` so the panel, `board_overview` and the director's own checks read
+one set of numbers. `vacant` (session dead 2h+, nothing in hand) states a fact and does not
+consume a roster-change approval.
+
 ## 0.3.6 — done means "I can show you how I checked"
 
 Three gaps that a board with 23 tasks and 9 hours left actually hit:

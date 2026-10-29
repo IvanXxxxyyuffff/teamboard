@@ -11,7 +11,7 @@ try:
         VERSION = _f.read().strip() or "2.1.0"
 except OSError:
     VERSION = "2.1.0"
-UI_URI = "ui://teamboard/panel15"   # v4: 面板改为经 MCP 代理取数（沙箱 CSP 禁 connect-src http）
+UI_URI = "ui://teamboard/panel16"   # v4: 面板改为经 MCP 代理取数（沙箱 CSP 禁 connect-src http）
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_FILE = os.path.join(HERE, "ui", "panel.html")
 UI_MIME = "text/html;profile=mcp-app"
@@ -429,7 +429,10 @@ def call(name, args):
                  f"{d['agg']['members']} 人｜平均进度 {d['agg']['overall']}%｜阻塞 {d['agg']['blocked']}", ""]
         for p in d["projects"]:
             s = p["stats"]
-            warn = f"｜⚠ 未登记 {len(p['unseated'])}" if p.get("unseated") else ""
+            hl = (p.get("health") or {}).get("summary") or ""
+            # 「全对得上」也要显出来：只有出事才说话的话，总监没法确认自己是干净的
+            warn = ("｜✅ 全部对得上" if hl == "全部对得上"
+                    else (f"｜⚠ {hl}" if hl else ""))
             lines.append(f"- **{p['name']}** {s['overall']}%｜完成 {s['done']}/{s['total']}｜"
                          f"进行中 {s['doing']}｜阻塞 {s['blocked']}｜"
                          f"{len(p['roles'])} 岗位 / {s['members']} 人{warn}")
@@ -479,7 +482,9 @@ def call(name, args):
             else:
                 tail = (x.get("dead_why") or "不在岗") + (f" · 已断 {x['gone_human']}"
                                                           if x["gone_for"] >= 0 else "")
-            lines.append(f"{mark} {x['seat']} {x['name']}（{x['role']}）— {tail}")
+            who = (f"{x['agent']}（{x['nickname']}）· 工位 {x['name']}"
+                   if x.get("agent") else x["name"])
+            lines.append(f"{mark} {x['seat']} {who}（{x['role']}）— {tail}")
             for d in x.get("doing") or []:
                 lines.append(f"    └ {d['title']} · {d['progress']}% · {d['idle_human']}没更新")
         if r.get("orphans"):

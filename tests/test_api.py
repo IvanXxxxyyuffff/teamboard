@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Board API smoke test: boots server.py on a throwaway port + DB, no side effects."""
-import json, os, subprocess, sys, pathlib
+import json, os, subprocess, sys, pathlib, time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _util import PLUGIN, PYTHON, free_port, temp_home, env_for, call, wait_health, kill_board
 
@@ -225,6 +225,37 @@ def main():
         check("a new event starts the seat again",
               restarted["state"] == "working" and not restarted.get("session_ended"),
               (restarted["state"], restarted.get("session_ended")))
+
+        # 静默 90 秒就不算在跑：900s 的宽窗口会让停掉的子代理继续亮 15 分钟「工作中」
+        old = time.time() - 130
+        os.utime(sess_file, (old, old))
+        time.sleep(2.2)          # 会话索引 2 秒缓存，等它过期再问
+        code, state = call(base, "GET", f"/api/projects/{pid}")
+        sleepy = [x for x in state["members"] if x["id"] == mem2["id"]][0]
+        check("a session silent for >90s is not 'working'",
+              sleepy["state"] != "working" and sleepy.get("session_silent") >= 90,
+              (sleepy["state"], sleepy.get("session_silent")))
+        os.utime(sess_file, None)
+
+        # 会话自报身份：agent_path 是「这一轮谁在干」，比手写工位名可靠
+        meta_line = json.dumps({"type": "session_meta", "payload": {
+            "id": tid, "source": {"subagent": {"thread_spawn": {
+                "depth": 1, "agent_path": "/root/srv_parity2",
+                "agent_nickname": "Franklin"}}}}})
+        body = sess_file.read_text(encoding="utf-8").splitlines()
+        body.insert(0, meta_line)
+        sess_file.write_text("\n".join(body) + "\n", encoding="utf-8")
+        code, state = call(base, "GET", f"/api/projects/{pid}")
+        ident = [x for x in state["members"] if x["id"] == mem2["id"]][0]
+        check("agent_path is parsed from the session header",
+              ident.get("agent_leaf") == "srv_parity2"
+              and ident.get("agent_nickname") == "Franklin",
+              (ident.get("agent_leaf"), ident.get("agent_nickname")))
+
+        # health：三处判断读同一份数字
+        code, hl = call(base, "GET", f"/api/projects/{pid}/health")
+        check("health endpoint answers what does not line up",
+              code == 200 and "summary" in hl and "counts" in hl, hl.get("counts"))
     finally:
         kill_board(base)
         try:
