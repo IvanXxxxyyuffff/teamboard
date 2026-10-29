@@ -44,15 +44,17 @@ def call(base, method, path, body=None, timeout=10):
 
 def wait_health(base, timeout=15):
     end = time.time() + timeout
+    last = ""
     while time.time() < end:
         try:
             code, body = call(base, "GET", "/api/health", timeout=1)
             if code == 200 and body.get("app") == "teamboard":
                 return body
-        except Exception:
-            pass
+            last = f"http {code}: {str(body)[:200]}"
+        except Exception as e:
+            last = f"{type(e).__name__}: {e}"
         time.sleep(0.15)
-    raise RuntimeError(f"board never became healthy on {base}")
+    raise RuntimeError(f"board never became healthy on {base} (last: {last})")
 
 
 def kill_board(base):

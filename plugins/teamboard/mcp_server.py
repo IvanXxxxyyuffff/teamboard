@@ -794,7 +794,17 @@ def error(rid, code, msg):
     sys.stdout.flush()
 
 
+def _safe_stdio():
+    """Windows 控制台默认 cp1252：中文/箭头日志会让 MCP 进程在握手前死掉。"""
+    for st in (sys.stdout, sys.stderr):
+        try:
+            st.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def main():
+    _safe_stdio()
     log(f"[teamboard-mcp] start, board={BASE}")
     for line in sys.stdin:
         line = line.strip()

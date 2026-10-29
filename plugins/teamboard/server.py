@@ -3233,7 +3233,17 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, {"ok": True})
 
 
+def _safe_stdio():
+    """Windows 控制台默认 cp1252：横幅里的「→」会让进程在 serve 之前直接死掉。"""
+    for st in (sys.stdout, sys.stderr):
+        try:
+            st.reconfigure(errors="replace")
+        except Exception:
+            pass
+
+
 def main():
+    _safe_stdio()
     global DB_PATH
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8787)
