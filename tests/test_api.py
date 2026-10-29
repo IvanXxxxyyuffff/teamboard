@@ -20,7 +20,19 @@ def main():
                             env=env_for(home, port), stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     try:
-        wait_health(base)
+        try:
+            wait_health(base)
+        except Exception:
+            # 起不来时把服务端的原始输出打出来：CI 上排查只能靠这一条
+            try:
+                proc.terminate()
+                out = proc.communicate(timeout=5)[0] or b""
+            except Exception:
+                out = b""
+            print("--- server output (tail) ---")
+            print(out.decode("utf-8", "replace")[-3000:])
+            print(f"--- exit code: {proc.returncode} ---")
+            raise
         version = (PLUGIN / "VERSION").read_text().strip()
         code, health = call(base, "GET", "/api/health")
         check("health 200", code == 200, code)
