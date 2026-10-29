@@ -158,6 +158,19 @@ option{background:#121518;color:var(--ink-1)}
   *{animation-duration:.001ms!important;transition-duration:.001ms!important;scroll-behavior:auto!important}
 }
 
+
+  /* 全员停摆 / 没有自驱：项目「会不会自己往前走」的全部答案，常驻不可折叠 */
+  .idlewrap:empty{display:none}
+  .idlewrap{padding:0 24px 10px}
+  .idleb{display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:10px;
+         font-size:12.5px;line-height:1.5;border:1px solid transparent}
+  .idleb+.idleb{margin-top:6px}
+  .idleb.bad{border-color:rgba(255,92,92,.42);background:rgba(255,92,92,.09);color:#ffb3ad}
+  .idleb.warn{border-color:rgba(255,196,84,.38);background:rgba(255,196,84,.08);color:#ffd79a}
+  .idleb b{color:#fff}
+  .idleb .more{margin-left:auto;color:var(--ink-3);font-size:11.5px;cursor:pointer;
+               text-decoration:underline;text-underline-offset:2px;white-space:nowrap}
+  .idleb .who{color:var(--ink-4);font-size:11.5px}
 </style>
 <style>
   /* ---------- shell ---------- */
@@ -902,6 +915,7 @@ container holding the app. Specify either width or maxWidth, and either height o
     </div>
     <div class="stats" id="stats"></div>
   </div>
+  <div class="idlewrap" id="idlebanner"></div>
 </header>
 
 <main>
@@ -1010,6 +1024,61 @@ function tickCd(){
 }
 setInterval(tickCd,1000);
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+/* 秒 → 人话 */
+function dur(sec){
+  sec=Math.max(0,Number(sec)||0);
+  if(sec<60) return sec+"秒";
+  if(sec<3600) return Math.floor(sec/60)+"分钟";
+  return Math.floor(sec/3600)+"小时"+Math.floor(sec%3600/60)+"分";
+}
+
+/* 两条横幅：① 现在有人在干活吗（idle）② 用户不说话时项目会不会自己跑（autopilot）。
+   ② 是根因，① 是症状。都不折叠——折叠等于没人看。 */
+function idleBanner(){
+  const box=document.getElementById("idlebanner");
+  if(!box) return;
+  const I=S.idle||{}, A=S.autopilot||{};
+  const rows=[];
+  if(I.alert){
+    const who=(I.silent||[]).slice(0,4)
+      .map(x=>`${esc(x.name)} ${x.silent>=0?dur(x.silent):"无会话"}`).join("　");
+    rows.push(`<div class="idleb bad">
+      <span>⚠ <b>全员停摆 ${esc(I.human)}</b>　${I.workers} 个员工里 0 个在干活，
+      手上还压着 <b>${I.open_tasks}</b> 条未收工</span>
+      <span class="more" onclick="idleDetail()">谁停最久</span>
+      <span class="who" id="idlewho" style="display:none">${who}</span>
+    </div>`);
+  }
+  if(!A.found&&S.project){
+    rows.push(`<div class="idleb warn">
+      <span>⚠ <b>没有自驱心跳</b>　你不出声，这一轮永远不会再来一次</span>
+      <span class="more" onclick="autopilotFix('enable')">补上</span>
+    </div>`);
+  }else if(A.found&&!A.has_board_check){
+    rows.push(`<div class="idleb warn">
+      <span>⚠ <b>心跳不看团队板</b>　每 ${A.interval_min} 分钟醒一次，但只干自己那条线</span>
+      <span class="more" onclick="autopilotFix('patch')">补一段</span>
+    </div>`);
+  }else if(A.too_slow){
+    rows.push(`<div class="idleb warn">
+      <span>⚠ <b>心跳太稀</b>　${A.interval_min} 分钟才醒一次</span>
+      <span class="more" onclick="autopilotFix('enable')">调密</span>
+    </div>`);
+  }
+  box.innerHTML=rows.join("");
+}
+function idleDetail(){
+  const el=document.getElementById("idlewho");
+  if(el) el.style.display=el.style.display==="none"?"inline":"none";
+}
+async function autopilotFix(action){
+  const r=await api("POST","/api/projects/"+PID+"/autopilot",{action});
+  toast(r&&r.ok?(action==="patch"?"已把「先看团队板」写进心跳":"自驱心跳已就绪")
+                :"失败："+((r&&r.error)||"未知"),r&&r.ok?"ok":"bad");
+  await refresh();
+}
+
 
 /* 事件委托：用户数据只进 data-*，不进 on* 属性。
    标题里带一个引号就能把内联 handler 撑破（存储型 XSS），这里彻底不拼 JS 字符串。 */
@@ -1359,6 +1428,7 @@ function render(){
   document.getElementById("prail").innerHTML=
     seg("done",s.done)+seg("doing",s.doing)+seg("review",s.review)+seg("blocked",s.blocked)+seg("backlog",s.backlog);
   document.getElementById("pstage").textContent=`完成 ${s.done} / ${s.total} 项`;
+  idleBanner();
   document.getElementById("stats").innerHTML=`
     <span class="chip"><b>${s.total}</b>任务</span>
     <span class="chip doing"><span class="d"></span>进行中<b>${s.doing}</b></span>

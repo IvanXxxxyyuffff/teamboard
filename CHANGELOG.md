@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.3.8 — the team that stops without saying so
+
+The real failure mode was never "hard task". It was **four workers idle and nobody noticing**.
+The director's attention is welded to its own thread; the roster is something it glances at and
+leaves. That cannot be fixed with a reminder, only with a mechanism.
+
+**`idle` — the aggregate nobody can misread.** `project_state` now returns how long the whole
+team has been dead: `{sec, human, alert, workers, working, open_tasks, silent[]}`, with `silent[]`
+sorted by who stopped longest ago. The lead is excluded — its job is dispatch, and counting it as
+labour makes a stalled team undetectable forever. At 15 minutes with open tasks,
+`propose_plan` / `add_member` / report export return **403 `need_idle_fix`**. The way out stays
+open: `update_task`, `heartbeat`, `bind_member`, `member_duty` are never blocked.
+
+**`autopilot` — who wakes the director when you say nothing.** Everything in this project was
+triggered by your message; silence meant standstill. The plugin now reads
+`~/.codex/automations/*/automation.toml`, finds the heartbeat aimed at the lead's thread, and
+reports three things: does it exist, does its prompt actually tell the director to look at the
+board, and is it firing often enough. Real case that motivated it: a 20-minute heartbeat existed
+and the board still sat idle for 45 minutes, because the prompt said `list_agents` — which only
+lists sessions that are *running*. Stopped ones vanish from that list, so the director saw
+"all clear" while nobody worked. `POST /api/projects/<pid>/autopilot
+{action: enable|patch|pause}` creates the heartbeat, or appends only the missing paragraph
+without touching the rest of your prompt.
+
+`project_status` and `board_overview` now open with these two lines, ahead of schedule and
+progress: both numbers improve while you work alone, and only this pair does not.
+
 ## 0.3.7 — identity comes from the session, not the prompt
 
 `s​ession_meta` already carries `payload.source.subagent.thread_spawn.{agent_path,

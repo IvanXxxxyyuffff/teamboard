@@ -34,6 +34,53 @@ description: 当用户问「我的团队现在在做什么 / 项目进度怎么�
 | `set_criteria` / `mark_criterion` | 把目标验收拆成可判定条目并标红绿 |
 | `tb_api` | 内部：面板经 MCP 代理取数用，总监不用直接调 |
 
+## 全员停摆（`idle`）与自驱（`autopilot`）——硬规则
+
+**这个团队最真实的故障不是「任务难」，是「一个人都没在干活，但没人发现」。**
+总监的注意力锁在自己那条线上，成员卡是「看一眼就走」的存在。靠自觉一定失效，只能靠机制。
+
+| 层 | 字段 / 接口 | 触发 | 后果 |
+|---|---|---|---|
+| 检测 | `project_state.idle` | 员工 0 个 `working` 且还有未收工任务 | 顶部红条 + `project_status` 第一行 |
+| 硬闸 | `idle_gate` | 停摆 ≥15 分钟 | `propose_plan` / `add_member` / 导出报告 403 `need_idle_fix` |
+| 自驱 | `project_state.autopilot` | 用户不说话 | 心跳到点把这一轮拉起来，醒来先看 `idle` |
+
+```json
+"idle": {"sec": 2734, "human": "45分钟", "alert": true,
+         "workers": 4, "working": 0, "open_tasks": 9,
+         "silent": [{"name": "quest3_detector", "silent": 2734, "load": 2}]}
+```
+
+- `alert=true` → **先派活，再干别的**。是这一轮的第一件事，不是「稍后处理」。
+- `silent[]` 按停得最久排序，直接点名，别自己再翻五张成员卡。
+- 总监不算劳动力（服务端已排除 `is_lead`）：总监自己 `working` 不代表团队在跑。
+- 放行的永远是**解闸动作**：`update_task` / `heartbeat` / `bind_member` / `member_duty`。
+
+救的顺序不能反：
+
+```text
+① 还在的会话 → member_duty(on=true) + heartbeat
+② 停掉的工位 → spawn_agent 重开 → bind_member（换会话不算换人，不走审批）
+③ backlog 里挑优先级最高的 → update_task(status="doing", assignee_id=<mid>)
+④ 确认 idle.alert=false，再回去干自己那条线
+```
+
+**不要用 `list_agents` 判断团队死活。** 它只列正在跑的会话，停掉的会从列表里凭空消失——
+看上去一片正常，其实一个人都没在干。唯一可信的判据是 `idle`。
+
+### 自驱心跳（`autopilot`）
+
+没有心跳，这个项目只在用户开口时存在。
+
+| 状态 | 含义 | 修法 |
+|---|---|---|
+| `found=false` | 没有心跳 | `POST /api/projects/<pid>/autopilot {"action":"enable"}` |
+| `has_board_check=false` | 有心跳但 prompt 没让看团队板 | `{"action":"patch"}` 只追加一段，原 prompt 不动 |
+| `too_slow=true` | 间隔 > 30 分钟 | `{"action":"enable","interval_min":15}` |
+
+拉起团队时必须同时把心跳建好：`propose_plan` 会在 `warnings` 里点名。批了计划却没心跳，
+等于签了一份不会执行的合同。
+
 ## 拉起团队的硬流程（缺一项，服务端直接拒绝）
 
 用户说「拉起一个团队做 X」时按顺序走，不许跳步。
@@ -190,13 +237,16 @@ spawn 时 `on:true`，收工 `on:false`。它决定面板显示「工作中」�
 
 可选：`priority`、`estimate`（加权进度用）、`resource`、`evidence`。
 
-## 三个硬闸
+## 四个硬闸
 
 1. **交付物存在性**：`deliverable` 支持 `a|b`、`a + b`、`{X,Y}.md`、通配符；
    相对路径按 `project.workdir` 解析。一个文件都不存在时，`status=done` 会被拒绝（400）。
 2. **证据等级**：`evidence=inferred` 的任务进度不能 ≥90%；要标完成得先补观测证据。
 3. **资源独占**：`resource`（如 `emulator-5556`）同时被两个 `doing` 任务占用时，看板红条告警。
    派活前先查目标页的资源冲突区，别让两个子代理抢同一台设备。
+4. **全员停摆**：员工 0 个在干活、且还有未收工任务，累计 ≥15 分钟 → `propose_plan` /
+   `add_member` / 导出报告 一律 403（`need_idle_fix`）。解闸动作照常放行：
+   `update_task` / `heartbeat` / `bind_member` / `member_duty`。
 
 ## 进度与停滞
 

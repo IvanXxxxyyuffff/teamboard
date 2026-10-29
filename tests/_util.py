@@ -28,6 +28,9 @@ def env_for(home, port, catalog=True):
     e["TEAMBOARD_PORT"] = str(port)
     # 会话目录指到临时 home：存活判定要读 rollout 文件，别去扫用户真实的 ~/.codex
     e["TEAMBOARD_SESSIONS"] = str(home / "sessions")
+    # 心跳目录同理：测试里 enable 自驱会真的写 automation.toml，
+    # 指到真实 ~/.codex/automations 等于往用户的生产环境里塞定时任务。
+    e["TEAMBOARD_AUTOMATIONS"] = str(home / "automations")
     if catalog:
         e["TEAMBOARD_CATALOG"] = str(ROOT / "tests" / "fixtures" / "models.json")
     return e

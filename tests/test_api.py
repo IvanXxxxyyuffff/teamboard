@@ -256,6 +256,48 @@ def main():
         code, hl = call(base, "GET", f"/api/projects/{pid}/health")
         check("health endpoint answers what does not line up",
               code == 200 and "summary" in hl and "counts" in hl, hl.get("counts"))
+
+        # 全员停摆：一个干活的都没有，但任务还挂着 doing/blocked。
+        # 这是这个项目最真实的故障——总监埋头干自己的，员工全停了它不知道。
+        old = time.time() - 1000
+        os.utime(sess_file, (old, old))
+        time.sleep(2.2)          # 会话索引 2 秒缓存
+        code, state = call(base, "GET", f"/api/projects/{pid}")
+        i = state.get("idle") or {}
+        check("all-idle team is flagged instead of looking fine",
+              i.get("alert") is True and i.get("working") == 0
+              and i.get("workers", 0) >= 1, i)
+        code, denied = call(base, "POST", f"/api/projects/{pid}/approvals",
+                            {"goal": "g", "goal_criteria": "c", "priority_ratio": "1:2:1",
+                             "members": [], "tasks": []})
+        check("a new plan is refused while everyone is idle",
+              code in (400, 403) and denied.get("need_idle_fix"), denied)
+        # 解闸动作必须放行，否则唯一出口也被锁上 → 死锁
+        code, freed = call(base, "PATCH", f"/api/tasks/{task['id']}",
+                           {"progress": 40})
+        check("the gate leaves a way out (task updates still work)", code == 200, freed)
+        os.utime(sess_file, None)
+
+        # 自驱心跳：用户不说话时，谁来把这一轮重新拉起来
+        code, lead = call(base, "POST", f"/api/projects/{pid}/members",
+                          {"name": "总监乙", "role": "项目总监", "is_lead": True})
+        code, state = call(base, "GET", f"/api/projects/{pid}")
+        lead = [x for x in state["members"] if x.get("is_lead")][0]
+        call(base, "POST", f"/api/projects/{pid}/members/{lead['id']}/bind",
+             {"thread_id": "01a9f9f9-2222-7333-8444-555566667777"})
+        code, ap = call(base, "POST", f"/api/projects/{pid}/autopilot", {"action": "enable"})
+        check("autopilot writes a heartbeat that targets the lead thread",
+              code == 200 and (ap.get("autopilot") or {}).get("found")
+              and (ap.get("autopilot") or {}).get("has_board_check"), ap)
+
+        code, st = call(base, "GET", f"/api/projects/{pid}")
+        a = st.get("autopilot") or {}
+        check("autopilot reports ready + interval once registered",
+              a.get("ready") is True and a.get("interval_min") == 15, a)
+
+        code, ap2 = call(base, "POST", f"/api/projects/{pid}/autopilot", {"action": "pause"})
+        check("autopilot can be paused (status flips off ACTIVE)",
+              code == 200 and (ap2.get("autopilot") or {}).get("status") == "PAUSED", ap2)
     finally:
         kill_board(base)
         try:

@@ -801,12 +801,29 @@ def create_approval(pid, b):
     gate = retro_gate(pid)
     if gate:
         return gate
+    # 全员停摆时不许提新计划：新计划 = 把人重新铺一遍，可一个人都没在跑，
+    # 铺出来的只会是又一份躺在数据库里的清单。
+    gate = idle_gate(pid)
+    if gate:
+        return gate
     tasks = b.get("tasks") or []
     members = b.get("members") or []
     problems = validate_plan(pid, b)
     if problems:
         return {"error": "计划字段不全，先补全再提交审批", "missing": problems}
     warns = plan_budget_warnings(pid, b)
+    # 自驱检查：审批通过只是「纸面开工」。没有心跳，这个项目在用户闭嘴那一刻
+    # 就停了。必须在批计划时就把话说明白，而不是等他明天问「怎么一天没动」。
+    ap = (project_state(pid) or {}).get("autopilot") or {}
+    if not ap.get("found"):
+        warns.append("没有自驱心跳：用户一闭嘴，这个项目就停了。批计划前先 "
+                     "POST /api/projects/%s/autopilot {action:enable}" % pid)
+    elif not ap.get("has_board_check"):
+        warns.append("心跳没有「先看团队板」这一步，醒来只会接着干自己那条线。"
+                     "补一段：POST /api/projects/%s/autopilot {action:patch}" % pid)
+    elif ap.get("too_slow"):
+        warns.append(f"心跳间隔 {ap.get('interval_min')} 分钟太长：停摆 15 分钟就该被发现。"
+                     f"建议 ≤15 分钟。")
     ratio, _rerr = parse_priority_ratio(b.get("priority_ratio"))
     ratio = ratio or DEFAULT_PRIORITY_RATIO
     aid = new_id("apr")
@@ -1339,6 +1356,12 @@ SESSION_SILENT_SEC = 90
 # 索引覆盖的天数。只扫 2 天会漏掉「三天前开的、一直在写」的长会话——主线程
 # 恰好就是这种：文件在 10-27 的目录里，写到今天，于是永远查不到、永远显示离线。
 SESSION_INDEX_DAYS = 10
+# 全员停摆阈值。总监的默认行为是「自己埋头干」，不回头看工位，
+# 于是 4 个员工全停了他也不知道。15 分钟是这个尺度的上限：
+# 短于 15 分钟可能只是某条命令跑得久（90 秒静默窗会让它短暂掉线），
+# 长于 15 分钟则意味着一整段排期被浪费掉了。
+# 触发后写操作全部 403，只有「派人干活」类动作放行——逼他先解决人。
+IDLE_ALERT_SEC = 900
 _AGENT_CACHE = {}
 # 事件流里的「这一轮结束了」。Codex 退出时补的是 turn_aborted，
 # 正常收工补的是 task_complete——两种都不是「还在干活」。
@@ -1656,6 +1679,308 @@ def retro_gate(pid):
                          f"在此之前 {'、'.join(r['blocked_actions'])} 一律拒绝",
                 "need_retro": True, "retro": r}
     return None
+
+
+# ---------------------------------------------------------------- autopilot
+# 项目的真正病根不是「总监懒」，是「没有自驱」：所有动作都由用户那句话触发，
+# 用户不开口，整个项目就停在原地。总监自己也不例外——它没有「醒着」这个状态。
+# 所以插件必须回答一个问题：**在用户不说话的情况下，谁能把总监叫醒？**
+# 答案只有一个：Codex 的 heartbeat automation（定时把这一轮重新拉起来）。
+# 没有它，看板再准也只是个仪表盘；有它，看板才变成闭环。
+#
+# 插件不自己 spawn codex（会跟 App 抢同一个 thread）。它只做三件事：
+# 发现 / 校验 / 把缺的东西原样给出来让总监一次调用就能注册。
+AUTO_DIR = os.environ.get("TEAMBOARD_AUTOMATIONS") or os.path.expanduser("~/.codex/automations")
+# 心跳 prompt 里必须出现「看图」的字眼，否则到点醒来也不会看团队，
+# 只会接着干自己那条线——实测就是这么停摆 45 分钟的。
+BOARD_WORDS = ("teamboard", "团队看板", "看板", "team board")
+TEAM_WORDS = ("成员", "员工", "idle", "在岗", "工位", "子代理", "team")
+_AUTO_CACHE = {"at": 0.0, "sig": None, "rows": []}
+
+
+def _toml_flat(text):
+    """顶层 key = value 的极简解析。文件是 Codex 自己写的固定形状，够用。"""
+    out = {}
+    for line in (text or "").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if v.startswith('"'):
+            try:
+                out[k] = json.loads(v)          # TOML 基本字符串 == JSON 字符串
+            except Exception:                   # noqa: BLE001
+                out[k] = v.strip('"')
+        else:
+            # 数字要还原成数字：写回时 str → 会被加引号，App 读 1793283393174
+            # 当字符串可能解析失败，心跳就静默失效了。
+            try:
+                out[k] = int(v)
+            except ValueError:
+                try:
+                    out[k] = float(v)
+                except ValueError:
+                    out[k] = v
+    return out
+
+
+def _rrule_minutes(rrule):
+    """RRULE → 分钟。只认 FREQ=MINUTELY/HOURLY/DAILY 这三种，够表达心跳。"""
+    up = (rrule or "").upper()
+    m = re.search(r"INTERVAL=(\d+)", up)
+    n = int(m.group(1)) if m else 1
+    if "FREQ=MINUTELY" in up:
+        return n
+    if "FREQ=HOURLY" in up:
+        return n * 60
+    if "FREQ=DAILY" in up:
+        return n * 1440
+    return 0
+
+
+def _automations():
+    """扫 automations 目录，20 秒缓存。目录变化（新建/删除）会立刻失效。"""
+    now = time.time()
+    try:
+        sig = sorted(os.listdir(AUTO_DIR))
+        sig = tuple((d, os.path.getmtime(os.path.join(AUTO_DIR, d, "automation.toml")))
+                    for d in sig
+                    if os.path.exists(os.path.join(AUTO_DIR, d, "automation.toml")))
+    except OSError:
+        return []
+    if _AUTO_CACHE["sig"] == sig and now - _AUTO_CACHE["at"] < 20:
+        return _AUTO_CACHE["rows"]
+    rows = []
+    for d, _mt in sig:
+        fp = os.path.join(AUTO_DIR, d, "automation.toml")
+        try:
+            with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                kv = _toml_flat(f.read())
+        except OSError:
+            continue
+        kv["_dir"] = d
+        kv["_mtime"] = _mt
+        rows.append(kv)
+    _AUTO_CACHE.update({"at": now, "sig": sig, "rows": rows})
+    return rows
+
+
+def automation_status(lead_thread):
+    """这个项目有没有自驱心跳？有 → 校验它会不会真去看团队；没有 → 给注册参数。"""
+    tid = (lead_thread or "").strip()
+    if not tid:
+        return {"found": False, "reason": "no_lead_thread",
+                "note": "总监还没绑定会话，无法确认它会不会被叫醒"}
+    hit = None
+    for r in _automations():
+        t = (r.get("target_thread_id") or "").strip()
+        if not t:
+            continue
+        # 前缀也算（thread id 有时被截断存），但优先全等
+        if t == tid or tid.startswith(t) or t.startswith(tid[:8]):
+            if hit is None or len(t) > len(hit.get("target_thread_id") or ""):
+                hit = r
+    if not hit:
+        return {"found": False, "reason": "no_heartbeat", "lead_thread": tid,
+                "register": {
+                    "tool": "automation_update",
+                    "kind": "heartbeat",
+                    "destination": "thread",
+                    "targetThreadId": tid,
+                    "name": "<项目名> · 自驱守夜",
+                    "rrule": "RRULE:FREQ=MINUTELY;INTERVAL=15",
+                    "prompt_keywords": ["teamboard", "idle", "成员状态"],
+                },
+                "note": "没有自驱心跳：用户不开口，这一轮永远不会再来一次"}
+    prompt = (hit.get("prompt") or "")
+    low = prompt.lower()
+    has_board = any(w in low for w in BOARD_WORDS)
+    has_team = any(w in low for w in TEAM_WORDS)
+    interval = _rrule_minutes(hit.get("rrule"))
+    return {"found": True, "id": hit.get("_dir"), "name": hit.get("name") or "",
+            "status": (hit.get("status") or "").upper(),
+            "rrule": hit.get("rrule") or "", "interval_min": interval,
+            "target_thread": hit.get("target_thread_id") or "",
+            "has_board_check": bool(has_board and has_team),
+            "prompt_chars": len(prompt),
+            # 醒得太稀 = 停摆检测窗口比心跳间隔还短，等于没装
+            "too_slow": bool(interval and interval > 30),
+            "patch_prompt": (
+                "\n\n【团队看板 · 每次醒来第一件事（不可跳过）】\n"
+                "先调 teamboard 的 board_overview / project_status，读 idle 字段。\n"
+                "不要用 list_agents 代替这一步：它只列「正在跑」的子代理，"
+                "已经停掉的会直接从列表里消失——看上去一片正常，其实一个人都没在干活。\n"
+                "- idle.alert=true → 全员停摆：先给每个空工位派活（update_task 认领 "
+                "+ member_duty），一个都不许留空；\n"
+                "- 有成员 state≠working 却挂着 doing 任务 → 先回收或重开（spawn → bind_member），"
+                "别当它还在跑；\n"
+                "- 再干自己那条线。不看团队就直接干活的这一轮，视为无效轮。\n")}
+
+
+def idle_gate(pid):
+    """全员停摆闸：一个干活的都没有 → 除了「派人干活」的写操作一律 403。
+
+    为什么必须做成硬闸：总监的注意力永远在自己手上那条线上，成员状态是
+    「看一眼就走」的存在。只在前端标红，实测结果是他根本不会翻到那一屏。
+    只有让「新增计划 / 加人 / 导报告」这些他真正想做的动作直接失败，
+    他才会回头去派活。
+
+    放行的动作（解闸路径）：update_task / heartbeat / bind_member / member_duty
+    / spawn 登记。拦这些等于把唯一出口也锁上，会死锁。
+    """
+    st = project_state(pid)
+    if not st:
+        return None
+    i = st.get("idle") or {}
+    if not i.get("alert"):
+        return None
+    who = "、".join(
+        f"{x['name']}(停 {_hm(x['silent']) if x['silent'] >= 0 else '无会话'})"
+        for x in (i.get("silent") or [])[:4])
+    return {"error": f"全员停摆 {i['human']}：{i['workers']} 个员工里 0 个在干活，"
+                     f"手上还压着 {i['open_tasks']} 条未收工。{who}。"
+                     f"先把活派下去（update_task 认领 + member_duty 分工 + 心跳），"
+                     f"再谈新计划。",
+            "need_idle_fix": True, "idle": i,
+            # 给出可直接照做的下一步，别让他再猜该调哪个接口
+            "next_actions": [
+                "GET  /api/projects/<pid>  → 看 idle.silent 里谁停最久",
+                "POST /api/members/<mid>/heartbeat  → 让活着的员工报活",
+                "POST /api/tasks/<tid>  {status:'doing', assignee_id:<mid>}  → 把 backlog 派下去",
+                "关掉的子代理要重开：spawn → bind_member（换会话不算换人，不走审批）",
+            ]}
+
+
+def autopilot_prompt(pid, name):
+    """自驱心跳的 prompt。写成模板，不写死某个项目——开源后别人拉起团队也能直接用。"""
+    return (
+        f"【{name or pid} · 自驱守夜】没有用户的新消息，这一轮是你自己被心跳叫醒的。"
+        "按顺序执行，不许跳步：\n"
+        "\n"
+        "1) 看团队（第一件事，不可跳过）：调用 teamboard 的 project_status，读 idle 字段。\n"
+        "   - idle.alert = true（全员停摆）→ 立刻派活：把 backlog 里优先级最高的任务 "
+        "update_task 认领 + member_duty 分工给每个人；一个工位都不许空着。\n"
+        "   - 成员 state ≠ working 却挂着 doing 任务 → 先回收（改回 backlog 或换人）"
+        "或重开子代理（spawn → bind_member）。不要假设它还活着。\n"
+        "   - 静默超过 15 分钟 = 掉线，按掉线处理。\n"
+        "2) 看关键路径：critical_gap > 0 说明按当前估算会晚点。要么砍范围，"
+        "要么加人——加人/换人必须走审批，不许自作主张。\n"
+        "3) 这一轮只推进一件事：critical_chain 上第一个未完成任务。不开新战线。\n"
+        "4) done 必须带 verify_cmd + verify_out（可重跑的命令和实测输出），缺一个不算完成。\n"
+        "5) 每步都更新 progress，不要攒到最后一次性写。\n"
+        "\n"
+        "通知规则：默认静默，不发进度噪音。只有三种情况给用户发消息——"
+        "(a) 交付完成；(b) 需要用户决策或动手；(c) 全员停摆超过 30 分钟且自救不了。"
+    )
+
+
+def set_autopilot(pid, b):
+    """注册 / 暂停 / 校验自驱心跳。插件自己写 automation.toml——
+    靠「提醒总监记得去建一个」是没用的，实测它会忘。"""
+    with db() as c:
+        p = c.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+        if not p:
+            return {"error": "no such project"}
+        lead = c.execute("SELECT * FROM members WHERE project_id=? AND is_lead=1"
+                         " ORDER BY created_at LIMIT 1", (pid,)).fetchone()
+    tid = ((dict(lead).get("thread_id") if lead else "") or "").strip()
+    act = (b.get("action") or "enable").strip().lower()
+    if act == "verify":
+        _AUTO_CACHE["at"] = 0.0
+        return {"ok": True, "autopilot": automation_status(tid)}
+    if not tid:
+        return {"error": "总监还没绑定会话线程（thread_id 为空），没法把心跳挂到它身上。"
+                         "先 bind_member 把主线程会话绑到总监工位。"}
+    # 先在目录里找已有的那条心跳（可能是总监自己建的，id 任意），
+    # 找不到才用本项目固定前缀新建。按 pid 硬推路径会漏掉已存在的文件。
+    cur = automation_status(tid)
+    if cur.get("found") and cur.get("id"):
+        fp = os.path.join(AUTO_DIR, cur["id"], "automation.toml")
+    else:
+        fp = os.path.join(AUTO_DIR, f"tb-{pid.replace('proj_', '')[:12]}", "automation.toml")
+    d = os.path.dirname(fp)
+    if act == "pause":
+        if not os.path.exists(fp):
+            return {"error": "这个项目还没有自驱心跳，无从暂停", "autopilot": automation_status(tid)}
+        kv = _toml_flat(open(fp, encoding="utf-8", errors="replace").read())
+        kv["status"] = "PAUSED"
+        kv["updated_at"] = int(time.time() * 1000)
+        _write_toml(fp, kv)
+        _AUTO_CACHE["at"] = 0.0
+        return {"ok": True, "autopilot": automation_status(tid)}
+    if act == "patch":
+        # 只追加「每次醒来先看团队板」这一段，原 prompt 一个字不动。
+        # 直接覆盖会把总监辛苦写的工作纪律冲掉，那种改法没人敢用第二次。
+        if not os.path.exists(fp):
+            return {"error": "这个项目还没有自驱心跳，先 enable", "autopilot": automation_status(tid)}
+        kv = _toml_flat(open(fp, encoding="utf-8", errors="replace").read())
+        old = kv.get("prompt") or ""
+        if "团队看板 · 每次醒来" in old:
+            _AUTO_CACHE["at"] = 0.0
+            return {"ok": True, "noop": True, "autopilot": automation_status(tid)}
+        kv["prompt"] = old + automation_status(tid).get("patch_prompt", "")
+        kv["updated_at"] = int(time.time() * 1000)
+        _write_toml(fp, kv)
+        _AUTO_CACHE["at"] = 0.0
+        with db() as c:
+            log_event(c, pid, "autopilot.patched", actor="director",
+                      payload="prompt += 看板 idle 检查")
+        return {"ok": True, "patched": True, "path": fp,
+                "autopilot": automation_status(tid)}
+    if os.path.exists(fp) and not b.get("force"):
+        # enable 的语义是「让它跑起来」。文件已存在但被暂停过，就改回 ACTIVE；
+        # 直接把 PAUSED 原样返回，等于告诉调用方成功、实际永不触发。
+        kv = _toml_flat(open(fp, encoding="utf-8", errors="replace").read())
+        if (kv.get("status") or "").upper() != "ACTIVE":
+            kv["status"] = "ACTIVE"
+            kv["updated_at"] = int(time.time() * 1000)
+            _write_toml(fp, kv)
+            _AUTO_CACHE["at"] = 0.0
+            return {"ok": True, "resumed": True, "path": fp,
+                    "autopilot": automation_status(tid)}
+        _AUTO_CACHE["at"] = 0.0
+        st = automation_status(tid)
+        st["exists"] = True
+        return st
+    interval = safe_int(b.get("interval_min"), 15, 5, 120)
+    name = (b.get("name") or (dict(p).get("name") or pid)).strip()
+    kv = {"version": 1, "id": os.path.basename(d), "kind": "heartbeat",
+          "name": f"{name} · 自驱守夜",
+          "prompt": autopilot_prompt(pid, name),
+          "status": "ACTIVE",
+          "rrule": f"RRULE:FREQ=MINUTELY;INTERVAL={interval}",
+          "target_thread_id": tid,
+          "created_at": int(time.time() * 1000),
+          "updated_at": int(time.time() * 1000)}
+    try:
+        os.makedirs(d, exist_ok=True)
+        _write_toml(fp, kv)
+    except OSError as e:
+        return {"error": f"写心跳文件失败：{e}", "path": fp}
+    _AUTO_CACHE["at"] = 0.0
+    with db() as c:
+        log_event(c, pid, "autopilot.enabled", actor="director",
+                  payload=f"interval={interval}m thread={tid[:8]}")
+    return {"ok": True, "path": fp, "autopilot": automation_status(tid)}
+
+
+def _write_toml(fp, kv):
+    """先写 .tmp 再 rename：心跳文件写在半截会被 App 读成坏配置。"""
+    lines = []
+    for k, v in kv.items():
+        if k.startswith("_"):
+            continue
+        if isinstance(v, bool):
+            lines.append(f"{k} = {'true' if v else 'false'}")
+        elif isinstance(v, (int, float)):
+            lines.append(f"{k} = {v}")
+        else:
+            lines.append(f"{k} = {json.dumps(str(v), ensure_ascii=False)}")
+    tmp = fp + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, fp)
 
 
 def project_state(pid):
@@ -2304,6 +2629,29 @@ def project_state(pid):
     except Exception:                                     # noqa: BLE001
         unseated = []                                     # 扫不到就不报，宁缺勿假
     prio_counts = {k: len([t for t in open_tasks if t["prio"] == k]) for k in (1, 2, 3)}
+    # 全员停摆：员工一个都不在干活。总监不算劳动力——它的活是调度，
+    # 拿总监算「还有人在工作」会让停摆永远检测不出来。
+    # 停摆时长取「最后一个停止写会话的人」到现在，这样才能说清「停了多久」；
+    # 「3 个人离线」这种说法没法行动。
+    workers = [m for m in members if not m.get("is_lead")]
+    open_n = len(open_tasks)
+    if not workers:
+        idle_sec, idle_reason = None, "no_workers"
+    elif any(m["state"] == "working" for m in workers):
+        idle_sec, idle_reason = 0, ""
+    else:
+        sils = [int(m["session_silent"]) for m in workers
+                if int(m.get("session_silent") if m.get("session_silent") is not None else -1) >= 0]
+        if sils:
+            idle_sec, idle_reason = min(sils), "all_silent"
+        else:
+            idle_sec, idle_reason = None, "no_session_data"
+    idle_alert = bool(idle_sec and idle_sec >= IDLE_ALERT_SEC and open_n)
+    # 自驱：用户不说话时，谁能把这一轮叫醒。没有心跳 = 项目只在你开口时才存在。
+    lead_m = next((m for m in members if m.get("is_lead")), None)
+    auto = automation_status((lead_m or {}).get("thread_id") or "")
+    auto["ready"] = bool(auto.get("found") and auto.get("has_board_check")
+                         and auto.get("status") == "ACTIVE" and not auto.get("too_slow"))
     # 关键路径剩余 = 链尾那条任务预计几点交 − 现在。
     # 不能把链上各任务的 eta_left 相加：它们已经各自从 now 起算，
     # A 0–2h、B 2–5h 相加得 7h，实际收工只要 5h——那样会把「差多少」直接虚报一半。
@@ -2334,6 +2682,28 @@ def project_state(pid):
             "priority_counts": prio_counts,
             "priority_declared_p1": len([t for t in open_tasks
                                          if t.get("priority_declared") == 1]),
+            # 全员停摆：不是「谁离线了」，而是「一个干活的都没有」。
+            # 总监看成员行会挑着看（谁在忙就夸谁），只有这个聚合值躲不掉。
+            "idle": {"sec": int(idle_sec) if idle_sec is not None else None,
+                     "human": _hm(idle_sec) if idle_sec else "",
+                     "reason": idle_reason,
+                     "alert": idle_alert,
+                     "threshold_sec": IDLE_ALERT_SEC,
+                     "workers": len(workers),
+                     "working": len([m for m in workers if m["state"] == "working"]),
+                     "open_tasks": open_n,
+                     # 每个人的静默秒数，长→短。总监要能一眼点名谁停得最久，
+                     # 而不是自己再翻五张成员卡。-1 = 没有会话数据（等于从没开工）
+                     "silent": sorted(
+                         [{"name": m.get("name") or "?", "seat_no": m.get("seat_no") or 0,
+                           "state": m["state"],
+                           "silent": int(m.get("session_silent") or -1),
+                           "task": m.get("current_task") or "",
+                           "load": int(m.get("load") or 0)}
+                          for m in workers],
+                         key=lambda x: (x["silent"] < 0, -(x["silent"] or 0)))},
+            # 自驱器：决定「用户不说话时项目会不会继续跑」
+            "autopilot": auto,
             # 编制：工位固定，会话可换。加人/换人/撤编都挂在这张申请单上等用户批
             "staff_requests": sreq,
             "staff_pending": [s for s in sreq if s["status"] == "pending"],
@@ -2706,6 +3076,11 @@ def add_member(pid, b):
     gate = retro_gate(pid)
     if gate:
         return gate
+    # 全员停摆时不许扩编：4 个人 0 个在跑，第 5 个人不会让项目变快，
+    # 只会多一具僵尸。先让现有的人动起来。
+    gate = idle_gate(pid)
+    if gate:
+        return gate
     err = check_model(b.get("model", "")) or check_effort(b.get("model", ""), b.get("effort", ""))
     if err:
         return {"error": err, "field": "effort"}
@@ -3074,6 +3449,12 @@ def project_health(pid, st=None):
                        "vacant": len(vacant), "unseated": len(unseated),
                        "orphan_tasks": len(orphan_tasks)},
             "summary": " · ".join(filter(None, [
+                # 停摆必须排在最前面：它是唯一一条「整队都没在动」的结论，
+                # 其余几项都只是局部异常。
+                (f"全员停摆 {(st.get('idle') or {}).get('human', '')}"
+                 if (st.get("idle") or {}).get("alert") else ""),
+                ("没有自驱心跳，用户不出声项目就停"
+                 if not (st.get("autopilot") or {}).get("ready") else ""),
                 f"{len(stale)} 个工位已静默" if stale else "",
                 f"{len(orphan_tasks)} 条任务无主" if orphan_tasks else "",
                 f"{len(unseated)} 个会话没登记工位" if unseated else "",
@@ -3410,6 +3791,11 @@ def overview():
             "resume": st.get("resume"),
             # 在跑但没落座的会话：首页就该喊，不然总监根本不知道有人在白跑
             "unseated": st.get("unseated") or [],
+            # 首页也要能一眼看出「这个项目还会不会自己往前走」
+            "idle": st.get("idle"),
+            "autopilot": {k: (st.get("autopilot") or {}).get(k)
+                          for k in ("found", "ready", "has_board_check",
+                                    "interval_min", "too_slow", "status")},
             # 一句话说清「哪里对不上」：面板和 board_overview 读同一份数字
             "health": {"summary": hl["summary"], "counts": hl["counts"]},
             "members": [{"id": m["id"], "name": m["name"], "role": m["role"],
@@ -3758,6 +4144,12 @@ class Handler(BaseHTTPRequestHandler):
             if gate:
                 gate["error"] = "导出被拦：" + gate["error"]
                 return self._send(403, gate)
+            # 交不了的报告不该交：全员停摆时导出的「进度」是假的，
+            # 用户看到的是百分比，看不到下面一个人都没在跑。
+            gate = idle_gate(m.group(1))
+            if gate:
+                gate["error"] = "导出被拦：" + gate["error"]
+                return self._send(403, gate)
             md = markdown_report(m.group(1))
             if md is None:
                 return self._send(404, {"error": "no such project"})
@@ -3826,6 +4218,10 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             r = create_approval(m.group(1), b)
             return self._send(400 if "error" in r else 201, r)
+        m = re.fullmatch(r"/api/projects/([\w]+)/autopilot", p)
+        if m:
+            r = set_autopilot(m.group(1), b)
+            return self._send(400 if "error" in r else 200, r)
         m = re.fullmatch(r"/api/projects/([\w]+)/members", p)
         if m:
             r = add_member(m.group(1), b)

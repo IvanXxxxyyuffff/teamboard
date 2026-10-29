@@ -29,6 +29,20 @@
   .hactions{display:flex;align-items:center;gap:8px;flex:0 0 auto}
   .hactions .btn{padding:9px 13px}
   .row2{display:flex;align-items:center;gap:18px;padding:0 24px 13px}
+  /* 全员停摆 / 没有自驱：这两条是「项目会不会自己往前走」的全部答案，
+     必须常驻在标题下面，不能折叠进某个 tab 里——折叠等于没人看。 */
+  .idlewrap:empty{display:none}
+  .idlewrap{padding:0 24px 10px}
+  .idleb{display:flex;align-items:center;gap:10px;padding:8px 12px;border-radius:10px;
+         font-size:12.5px;line-height:1.5;border:1px solid transparent;cursor:default}
+  .idleb+.idleb{margin-top:6px}
+  .idleb.bad{border-color:rgba(255,92,92,.42);background:rgba(255,92,92,.09);color:#ffb3ad}
+  .idleb.warn{border-color:rgba(255,196,84,.38);background:rgba(255,196,84,.08);color:#ffd79a}
+  .idleb.ok{border-color:rgba(120,255,170,.24);background:rgba(120,255,170,.05);color:var(--ink-3)}
+  .idleb b{color:#fff}
+  .idleb .more{margin-left:auto;color:var(--ink-3);font-size:11.5px;cursor:pointer;
+               text-decoration:underline;text-underline-offset:2px;white-space:nowrap}
+  .idleb .who{color:var(--ink-4);font-size:11.5px}
   .prog{display:flex;align-items:center;gap:12px;flex:0 0 300px;min-width:0}
   .prog .pct{font-size:22px;font-weight:800;color:var(--ink-1);letter-spacing:-.05em;line-height:1;
     font-variant-numeric:tabular-nums;min-width:56px}
@@ -566,6 +580,7 @@
     </div>
     <div class="stats" id="stats"></div>
   </div>
+  <div class="idlewrap" id="idlebanner"></div>
 </header>
 
 <main>
@@ -718,6 +733,68 @@ function askNote(title,ph,okText){
 }
 const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 
+/* 秒 → 人话 */
+function dur(sec){
+  sec=Math.max(0,Number(sec)||0);
+  if(sec<60) return sec+"秒";
+  if(sec<3600) return Math.floor(sec/60)+"分钟";
+  return Math.floor(sec/3600)+"小时"+Math.floor(sec%3600/60)+"分";
+}
+
+/* 两条横幅，回答两个不同的问题：
+   ① 现在有人在干活吗（idle）
+   ② 用户不说话的时候，这个项目会不会自己继续跑（autopilot）
+   只有 ① 是警报，② 是根因。两个都不折叠。 */
+function idleBanner(){
+  const box=document.getElementById("idlebanner");
+  if(!box) return;
+  const I=S.idle||{}, A=S.autopilot||{};
+  const rows=[];
+  if(I.alert){
+    const who=(I.silent||[]).slice(0,4)
+      .map(x=>`${esc(x.name)} ${x.silent>=0?dur(x.silent):"无会话"}`).join("　");
+    rows.push(`<div class="idleb bad">
+      <span>⚠ <b>全员停摆 ${esc(I.human)}</b>　${I.workers} 个员工里 0 个在干活，
+      手上还压着 <b>${I.open_tasks}</b> 条未收工</span>
+      <span class="more" onclick="idleDetail()">谁停最久</span>
+      <span class="who" id="idlewho" style="display:none">${who}</span>
+    </div>`);
+  }else if(I.workers && I.working){
+    // 正常态不占地方，只在标题右边留一个数，别把屏幕塞满
+  }
+  if(!A.found){
+    rows.push(`<div class="idleb warn">
+      <span>⚠ <b>没有自驱心跳</b>　你不出声，这一轮就永远不会再来一次；项目停在原地不是它慢，是它没被叫醒</span>
+      <span class="more" onclick="autopilotFix('enable')">补上</span>
+    </div>`);
+  }else if(!A.has_board_check){
+    rows.push(`<div class="idleb warn">
+      <span>⚠ <b>心跳不看团队板</b>　每 ${A.interval_min} 分钟醒一次，但醒来只干自己那条线，员工停摆它看不见</span>
+      <span class="more" onclick="autopilotFix('patch')">补一段</span>
+    </div>`);
+  }else if(A.too_slow){
+    rows.push(`<div class="idleb warn">
+      <span>⚠ <b>心跳太稀</b>　${A.interval_min} 分钟才醒一次，停摆 15 分钟就该被发现</span>
+      <span class="more" onclick="autopilotFix('enable')">调密</span>
+    </div>`);
+  }else if(A.found&&!A.status){
+    rows.push(`<div class="idleb warn"><span>⚠ 自驱心跳状态未知</span></div>`);
+  }
+  box.innerHTML=rows.join("");
+}
+
+function idleDetail(){
+  const el=document.getElementById("idlewho");
+  if(el) el.style.display=el.style.display==="none"?"inline":"none";
+}
+
+async function autopilotFix(action){
+  const r=await api("POST","/api/projects/"+PID+"/autopilot",{action});
+  toast(r&&r.ok?(action==="patch"?"已把「先看团队板」写进心跳":"自驱心跳已就绪")
+                :"失败："+((r&&r.error)||"未知"),r&&r.ok?"ok":"bad");
+  await refresh();
+}
+
 /* 事件委托：用户数据只进 data-*，不进 on* 属性。
    标题里带一个引号就能把内联 handler 撑破（存储型 XSS），这里彻底不拼 JS 字符串。 */
 document.addEventListener("click", e => {
@@ -782,6 +859,7 @@ function render(){
     <span class="chip blocked"><span class="d"></span>阻塞<b>${s.blocked}</b></span>
     <span class="chip done"><span class="d"></span>完成<b>${s.done}</b></span>
     ${acceptChip()}`;
+  idleBanner();
   document.getElementById("onlineTxt").textContent=
     `工作中 ${s.working||0}`
     + ((s.stalled)?` · 僵住 ${s.stalled}`:"")

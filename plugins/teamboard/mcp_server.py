@@ -113,10 +113,48 @@ def touch_lead(pid):
         log("touch_lead failed:", e)
 
 
+def _idle_line(st):
+    """「现在有人在干活吗」。总监最容易跳过的一行，所以要顶到最前面。"""
+    i = st.get("idle") or {}
+    if not i.get("workers"):
+        return "人：编制里一个员工都没有（只有你）。先 add_member，再谈进度。"
+    if i.get("alert"):
+        names = "、".join(
+            f"{x['name']}({fmt_dur(x['silent']) if (x.get('silent') or -1) >= 0 else '无会话'})"
+            for x in (i.get("silent") or [])[:4])
+        return (f"⛔ 全员停摆 {i.get('human')}：{i['workers']} 个员工里 0 个在干活，"
+                f"手上还压着 {i.get('open_tasks')} 条未收工。{names}。"
+                f"→ 先派活（update_task 认领 + member_duty 分工），再干别的。")
+    return (f"人在干活：{i.get('working')}/{i['workers']} 个员工在跑，"
+            f"手里未收工 {i.get('open_tasks')} 条")
+
+
+def _autopilot_line(st):
+    """「你不出声的时候，这个项目会不会自己往前走」。这是根因，不是症状。"""
+    a = st.get("autopilot") or {}
+    if not a.get("found"):
+        return ("⛔ 没有自驱心跳：用户一闭嘴，这一轮就永远不会再来一次。"
+                f"→ POST /api/projects/{st.get('project',{}).get('id','<pid>')}"
+                '/autopilot {"action":"enable"}')
+    if not a.get("has_board_check"):
+        return (f"⚠ 自驱心跳每 {a.get('interval_min')} 分钟醒一次，但 prompt 没有"
+                "「先看团队板」这一步——醒来只会接着干自己那条线，员工停了它看不见。"
+                f"→ POST /api/projects/{st.get('project',{}).get('id','<pid>')}"
+                '/autopilot {"action":"patch"}')
+    if a.get("too_slow"):
+        return f"⚠ 自驱间隔 {a.get('interval_min')} 分钟太稀（停摆 15 分钟就该被发现）"
+    return f"自驱：每 {a.get('interval_min')} 分钟自动醒来一次，醒来先看团队板 ✅"
+
+
 def summarize(p):
     st = http("GET", "/api/projects/" + p["id"])
     s = st["stats"]
     lines = [f"# {p['name']}　{s['overall']}%",
+             # 第一句永远是「有没有人在干活」。
+             # 放在排期/进度前面是故意的：这两个数字都能在自己埋头干的时候慢慢变好，
+             # 只有 idles 不会。总监最容易漏掉的就是这一行。
+             _idle_line(st),
+             _autopilot_line(st),
              f"目标：{p.get('goal') or '-'}" + (f"　截止：{p['deadline']}" if p.get("deadline") else ""),
              "排期：" + ("·".join(filter(None, [
                  ("预计收工 " + time.strftime("%H:%M", time.localtime(st["eta_finish"]))
