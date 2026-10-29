@@ -1,5 +1,8 @@
 # TeamBoard
 
+![ci](https://github.com/IvanXxxxyyuffff/teamboard/actions/workflows/ci.yml/badge.svg)
+![license](https://img.shields.io/badge/license-MIT-black)
+
 An in-chat kanban for AI teams. Open one panel and see **which teams you are running, who is on
 each one, what every member is doing right now, how far along it is, and where it is stuck.**
 

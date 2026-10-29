@@ -25,6 +25,15 @@ priority quotas, resource leases, evidence gates, deadline/critical-path math.
   `?limit=` is clamped instead of crashing.
 
 ### Fixed
+- **Windows: the board died before serving.** The startup banner contained `→`; hosted Windows
+  runners print through cp1252, so `UnicodeEncodeError` killed the process. Both entry points now
+  reconfigure stdio to UTF-8 with `errors="replace"`, and the MCP child's stdio is decoded as UTF-8.
+- **macOS/Windows: `127.0.0.1` was routed through `HTTP_PROXY`.** Those runners export proxy vars;
+  urllib sent loopback probes to the proxy and every health check timed out while the board was
+  actually up. Proxies are disabled for the health probe, the MCP client and the test helpers.
+- **Slow DNS stalled startup.** `HTTPServer.server_bind()` reverse-resolves the bind address; on a
+  machine without working DNS that blocks before `serve_forever()`. Binds through `TCPServer`
+  directly and prints the banner first, so a startup hang is visible.
 - `POST /api/projects` returns 400 (not 201) on validation failure.
 - Panel API base is resolved through the MCP proxy (`tb_api`) instead of injected `window.__TB_API__`.
 - Portable defaults everywhere: `TEAMBOARD_HOME`, `TEAMBOARD_PORT`, `TEAMBOARD_DB`,
