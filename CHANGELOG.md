@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.5 — a written file is not a running agent
+
+The previous fix closed the exit path (`turn_aborted` / `task_complete`) but left the entry
+path open: restarting Codex appends `session_meta` / `turn_context` / `compacted`, and sending
+a message appends `user_message`. All of them bump the mtime, so a team that had not started
+anything yet read "working" again. Liveness now requires a **busy** tail event —
+`function_call`, `function_call_output`, `reasoning`, `token_count`, `item_*`, `agent_message`,
+`token_usage_record`. Anything else means the file was touched, not that someone is working.
+
+`user_message` is reported separately as `session_awaiting`: the user just pressed send and the
+agent has not started yet. Same idea applies to the `unseated` scan — a session that only has
+its opening metadata is no longer reported as an agent that is burning tokens without a seat.
+
+Registration is now a hard step, not advice: `board_overview` and `resume_brief` lead with
+`⚠ N sessions are running but have no seat`, and both SKILL.md files spell out the two calls
+that must follow every `spawn_agent` (`bind_member` with the full UUID, then `member_duty`).
+
 ## 0.3.4 — sync with the subagent, not with its timestamp
 
 The rollout file's mtime gets bumped by the event Codex appends *on the way out*

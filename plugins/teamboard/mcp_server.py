@@ -11,7 +11,7 @@ try:
         VERSION = _f.read().strip() or "2.1.0"
 except OSError:
     VERSION = "2.1.0"
-UI_URI = "ui://teamboard/panel13"   # v4: 面板改为经 MCP 代理取数（沙箱 CSP 禁 connect-src http）
+UI_URI = "ui://teamboard/panel14"   # v4: 面板改为经 MCP 代理取数（沙箱 CSP 禁 connect-src http）
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_FILE = os.path.join(HERE, "ui", "panel.html")
 UI_MIME = "text/html;profile=mcp-app"
@@ -393,12 +393,26 @@ def call(name, args):
         d = http("GET", "/api/overview")
         for p in d["projects"]:
             touch_lead(p["id"])
-        lines = [f"共 {d['agg']['projects']} 个项目｜{d['agg']['tasks']} 个任务｜"
+        # 没落座的会话排在最前面：它们不出现在任何成员行里，只在后台烧 token。
+        # 放在总览之后，总监扫一眼就会漏掉。
+        loose = [(p["name"], p["unseated"]) for p in d["projects"] if p.get("unseated")]
+        lines = []
+        if loose:
+            n = sum(len(x[1]) for x in loose)
+            who = "、".join(f"{nm}（{', '.join(s['short'] for s in ss[:3])}）"
+                            for nm, ss in loose)
+            lines += [f"⚠ 有 {n} 个会话在跑但**没登记工位**：{who}",
+                      "　看板看不见它们 → 派不了活、记不了工时、点不开会话。开工第一件事：",
+                      '　bind_member(member="<工位名>", thread_id="<全 UUID>") '
+                      '然后 member_duty(member="<工位名>", on=true, minutes=45)', ""]
+        lines += [f"共 {d['agg']['projects']} 个项目｜{d['agg']['tasks']} 个任务｜"
                  f"{d['agg']['members']} 人｜平均进度 {d['agg']['overall']}%｜阻塞 {d['agg']['blocked']}", ""]
         for p in d["projects"]:
             s = p["stats"]
+            warn = f"｜⚠ 未登记 {len(p['unseated'])}" if p.get("unseated") else ""
             lines.append(f"- **{p['name']}** {s['overall']}%｜完成 {s['done']}/{s['total']}｜"
-                         f"进行中 {s['doing']}｜阻塞 {s['blocked']}｜{len(p['roles'])} 岗位 / {s['members']} 人")
+                         f"进行中 {s['doing']}｜阻塞 {s['blocked']}｜"
+                         f"{len(p['roles'])} 岗位 / {s['members']} 人{warn}")
         # 新会话第一眼就要看到：有人断了、任务还挂着 doing。
         # 不提示的话，总监会默认「进行中＝有人在做」，然后空等。
         stuck = [p["name"] for p in d["projects"] if (p.get("resume") or {}).get("needs_reconcile")]
@@ -425,6 +439,13 @@ def call(name, args):
         lines = [f"# 交班简报 · {r.get('name') or p['name']}",
                  f"{r['verdict']}",
                  f"（最后一次有人在干活：{r.get('last_active_at') or '无记录'}）", ""]
+        if r.get("unseated"):
+            lines += ["## ⚠ 在跑但没落座 " + str(len(r["unseated"])) + " 个",
+                      "　它们不在任何成员行里：派不了活、记不了工时、点不开会话。先落座再谈别的。"]
+            for u in r["unseated"]:
+                lines.append(f'　- {u["short"]} · 已跑 {u.get("age_min", 0)} 分钟 → '
+                             f'bind_member(member="<工位名>", thread_id="{u["id"]}")')
+            lines.append("")
         lead = [x for x in r["team"] if x.get("is_lead")]
         others = [x for x in r["team"] if not x.get("is_lead")]
         for x in lead + others:

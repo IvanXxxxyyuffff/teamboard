@@ -142,12 +142,35 @@ def main():
         day = home / "sessions" / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
         day.mkdir(parents=True, exist_ok=True)
         tid = "01a2b3c4-1111-7222-8333-444455556666"
-        (day / f"rollout-2026-01-01T00-00-00-{tid}.jsonl").write_text(
+        sess_file = day / f"rollout-2026-01-01T00-00-00-{tid}.jsonl"
+        sess_file.write_text(
             json.dumps({"type": "session_meta",
                         "payload": {"id": tid, "parent_thread_id": ""}}) + "\n",
             encoding="utf-8")
         call(base, "POST", f"/api/projects/{pid}/members/{mem2['id']}/bind",
              {"thread_id": tid})
+        # 建会话 ≠ 开工：重启 Codex 会在会话里补一笔 session_meta，mtime 是「刚刚」，
+        # 但这一秒没有任何人在跑。只认工具/思考类事件（BUSY_TAIL）。
+        code, state = call(base, "GET", f"/api/projects/{pid}")
+        fresh = [x for x in state["members"] if x["id"] == mem2["id"]][0]
+        check("a freshly created session is not 'working' yet",
+              fresh["state"] != "working" and fresh.get("session_tail") == "session_meta",
+              (fresh["state"], fresh.get("session_tail")))
+        # 用户发完消息、agent 还没动手：也是「等指令」，不是「在干活」
+        with sess_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "event_msg",
+                                "payload": {"type": "user_message"}}) + "\n")
+        os.utime(sess_file, None)
+        code, state = call(base, "GET", f"/api/projects/{pid}")
+        idle = [x for x in state["members"] if x["id"] == mem2["id"]][0]
+        check("a user message with no run yet is not 'working'",
+              idle["state"] != "working" and idle.get("session_awaiting") is True,
+              (idle["state"], idle.get("session_awaiting")))
+        # agent 真跑起来：尾部出现工具调用，才算在岗
+        with sess_file.open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "response_item",
+                                "payload": {"type": "function_call_output"}}) + "\n")
+        os.utime(sess_file, None)
         code, state = call(base, "GET", f"/api/projects/{pid}")
         live = [x for x in state["members"] if x["id"] == mem2["id"]][0]
         check("a blocked task with a live session reads as working",
@@ -161,7 +184,6 @@ def main():
 
         # 收工：Codex 退出/收尾时会补一笔 turn_aborted / task_complete。
         # 那笔会把 mtime 刷成「刚刚」，但人已经不在跑了——只认事件，不认 mtime。
-        sess_file = day / f"rollout-2026-01-01T00-00-00-{tid}.jsonl"
         with sess_file.open("a", encoding="utf-8") as f:
             f.write(json.dumps({"type": "event_msg",
                                 "payload": {"type": "turn_aborted"}}) + "\n")

@@ -1319,7 +1319,22 @@ SESSION_LIVE_WINDOW = HEARTBEAT_WINDOW   # 与会话/心跳同一个窗口，别
 # 事件流里的「这一轮结束了」。Codex 退出时补的是 turn_aborted，
 # 正常收工补的是 task_complete——两种都不是「还在干活」。
 TERMINAL_EVENTS = {"task_complete", "turn_aborted"}
+# 只有这些尾部事件能证明「这一刻真的在跑」。白名单是必须的：
+# 重启 Codex 会在会话里写 session_meta / turn_context / compacted，用户发消息写
+# user_message——这些都会被 mtime 骗成「刚写过」。
+# 黑名单做法（只排除终态）实测漏掉这一整类：重启后什么都没干，主线程亮「工作中」。
+BUSY_TAIL = {"function_call", "function_call_output", "reasoning", "token_count",
+             "item_started", "item_completed", "agent_message", "token_usage_record"}
+IDLE_TAIL = {"user_message"}             # 用户刚发、agent 还没动 = 等指令，不是在工作
 _TAIL_CACHE = {}
+
+
+def _ts_epoch(s):
+    """rollout 的 timestamp 是 UTC ISO（2026-10-29T07:15:50.453Z）。"""
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def session_tail(path):
@@ -1342,7 +1357,8 @@ def session_tail(path):
     try:
         with open(path, "rb") as f:
             f.seek(max(0, st.st_size - 20000))
-            lines = f.read().decode("utf-8", "ignore").strip().splitlines()
+            lines = [x for x in f.read().decode("utf-8", "ignore").strip().splitlines()
+                     if x.lstrip().startswith("{")]      # 尾部常留半行（文件正在写）
         for ln in reversed(lines):
             try:
                 d = json.loads(ln)
@@ -1351,6 +1367,7 @@ def session_tail(path):
             pl = d.get("payload") or {}
             info = {"type": (pl.get("type") if isinstance(pl, dict) else "") or d.get("type", ""),
                     "ts": d.get("timestamp", ""),
+                    "epoch": _ts_epoch(d.get("timestamp", "")),
                     "reason": (pl.get("reason") if isinstance(pl, dict) else "") or ""}
             break
     except OSError:
@@ -1694,10 +1711,23 @@ def project_state(pid):
         m["session_live"] = bool(sess_mt_full) and (now - sess_mt_full) < SESSION_LIVE_WINDOW
         # mtime 新 ≠ 有人在干：退出 Codex 时它会补一笔 turn_aborted / task_complete。
         # 最后一笔是「收工」，这条会话此刻就没有在跑——不管 mtime 有多新。
+        # 而且「写了文件」也只证明写过：重启补的 session_meta、用户发消息写的
+        # user_message 都会刷新 mtime。只认 BUSY_TAIL（工具/思考/流式增量）才算在跑。
         if sess_mt_full:
             tail = session_tail((_LIVE_CACHE.get("paths") or {}).get(tid0, ""))
-            if tail.get("type") in TERMINAL_EVENTS:
-                m["session_ended"] = tail["type"]
+            ttype = tail.get("type") or ""
+            m["session_tail"] = ttype
+            m["session_tail_age"] = (max(0, int(now - tail["epoch"]))
+                                     if tail.get("epoch") else -1)
+            if ttype in TERMINAL_EVENTS:
+                m["session_ended"] = ttype
+                m["session_live"] = False
+            elif ttype in IDLE_TAIL:
+                m["session_awaiting"] = True        # 用户刚发、agent 还没动
+                m["session_live"] = False
+            elif ttype and ttype not in BUSY_TAIL:
+                # 重启/压缩/建会话这类「非工作事件」落在尾部：文件是新的，人没在跑
+                m["session_idle_tail"] = ttype
                 m["session_live"] = False
         # 宿主进程探活：Codex 一退出，子代理就再也不会有任何回调，
         # 只靠心跳/会话窗口会让看板继续显示「工作中」5~15 分钟。
@@ -2150,9 +2180,11 @@ def project_state(pid):
             if r.get("parent") not in mine_parents:      continue
             if r.get("id") in bound:                     continue
             if now - r.get("mtime", 0) > UNSEATED_LIVE_SEC: continue
-            # 收工了的不算「在跑」：退出时补的那笔也会刷新 mtime
+            # 收工了的不算「在跑」：退出时补的那笔也会刷新 mtime。
+            # 只有 BUSY_TAIL（工具/思考/流式增量）才证明这一秒真的在干活，
+            # 否则「刚建还没开口的会话」也会被当成没落座的员工报警。
             tail = session_tail((_LIVE_CACHE.get("paths") or {}).get(r["id"], ""))
-            if tail.get("type") in TERMINAL_EVENTS:      continue
+            if (tail.get("type") or "") not in BUSY_TAIL: continue
             # 子代理被关掉又重开 = 一条新会话。工位还绑着旧会话，看板就会显示「摸鱼」，
             # 而人明明在跑。会话开头（spawn 的 prompt）写了工位名，且该工位当前没有活会话
             # → 让原员工接管这条新会话。只认「恰好一个」候选，认不准就晾着让人来定。
@@ -2931,6 +2963,15 @@ def resume_brief(pid):
         actions.append("当前没有人在岗：先按原编制把子代理拉起来并 bind_member，再谈新任务")
     if not actions:
         actions.append("无需处置，直接继续原计划")
+    # 在跑但没登记工位的会话：不算员工，却在烧 token。这是「看板对不上实际情况」
+    # 的第一大来源，必须让总监在开工第一步就看到。
+    unseated = st.get("unseated") or []
+    if unseated:
+        verdict = (f"⚠ {len(unseated)} 个会话在跑但没登记工位"
+                   f"（{', '.join(x['short'] for x in unseated[:3])}）——看板看不见它，"
+                   f"派不了活、记不了时，等于白跑。先 bind_member。 | " + verdict)
+        actions.insert(0, "先给在跑的会话落座：bind_member(member=\"<工位名>\", "
+                          "thread_id=\"<全 UUID>\")，再 member_duty(on=true, minutes=45)")
 
     return {
         "project_id": pid, "name": st["project"].get("name", ""), "generated_at": now_iso(),
@@ -2941,6 +2982,7 @@ def resume_brief(pid):
         "needs_reconcile": bool(orphans),
         "verdict": verdict,
         "orphans": orphans,
+        "unseated": unseated,
         "team": team,
         "actions": actions,
         "note": "这是事实快照，不是建议：先处置 orphans，再派新活。",
@@ -3152,6 +3194,8 @@ def overview():
                        "progress": r["progress"]} for r in st["roles"]],
             # 首页卡片也要能看出「有人断了、任务还挂着」——点进去才发现就太晚了
             "resume": st.get("resume"),
+            # 在跑但没落座的会话：首页就该喊，不然总监根本不知道有人在白跑
+            "unseated": st.get("unseated") or [],
             "members": [{"id": m["id"], "name": m["name"], "role": m["role"],
                          "state": m["state"], "kind": m["kind"], "progress": m["progress"],
                          "current_task": m["current_task"],
