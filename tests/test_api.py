@@ -94,6 +94,34 @@ def main():
         check("project state has stats/tasks/members",
               all(k in state for k in ("stats", "tasks", "members")), list(state)[:8])
         check("progress is numeric", isinstance(state["stats"].get("overall"), (int, float)), state["stats"])
+
+        # 编制冻结：批准单只能用一次、人名/岗位不能直接改
+        code, reuse = call(base, "POST", f"/api/projects/{pid}/members",
+                           {"name": "蹭审批", "role": "测试", "approval_id": req["id"]})
+        check("a staff approval can only be consumed once",
+              code >= 400 and "用过" in json.dumps(reuse, ensure_ascii=False), reuse)
+
+        code, renamed = call(base, "PATCH", f"/api/members/{mem2['id']}", {"name": "偷偷改名"})
+        check("renaming a seat member needs approval",
+              code >= 400 and renamed.get("staff_request_required"), renamed)
+
+        code, renamed_role = call(base, "PATCH", f"/api/members/{mem2['id']}", {"role": "换个岗位"})
+        check("changing a seat role needs approval",
+              code >= 400 and renamed_role.get("staff_request_required"), renamed_role)
+
+        # 交班简报：宿主进程不存在时必须当场判死，不能等心跳过期
+        call(base, "PATCH", f"/api/tasks/{task['id']}",
+             {"status": "doing", "progress": 10, "assignee_id": mem2["id"]})
+        call(base, "POST", f"/api/members/{mem2['id']}/heartbeat", {"pid": 999999})
+        code, brief = call(base, "GET", f"/api/projects/{pid}/resume-brief")
+        check("resume brief answers who is gone",
+              code == 200 and brief.get("total") and brief.get("verdict"), brief)
+        dead = [x for x in brief.get("team", []) if x["id"] == mem2["id"]]
+        check("dead host process marks the member stale at once",
+              dead and dead[0]["state"] in ("stale", "offline")
+              and dead[0]["dead_reason"] == "process", dead)
+        check("orphan doing task is surfaced for handover",
+              any(o["task_id"] == task["id"] for o in brief.get("orphans", [])), brief.get("orphans"))
     finally:
         kill_board(base)
         try:

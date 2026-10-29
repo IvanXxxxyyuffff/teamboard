@@ -11,7 +11,7 @@ try:
         VERSION = _f.read().strip() or "2.1.0"
 except OSError:
     VERSION = "2.1.0"
-UI_URI = "ui://teamboard/panel9"   # v4: 面板改为经 MCP 代理取数（沙箱 CSP 禁 connect-src http）
+UI_URI = "ui://teamboard/panel10"   # v4: 面板改为经 MCP 代理取数（沙箱 CSP 禁 connect-src http）
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_FILE = os.path.join(HERE, "ui", "panel.html")
 UI_MIME = "text/html;profile=mcp-app"
@@ -22,6 +22,19 @@ _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 带�
 
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+def _host():
+    """Codex 宿主进程。MCP server 是 Codex 拉起来的，父进程没了＝Codex 关了。
+
+    把这个 pid 登记到看板，宿主一退出就能当场判定「人不在了」，
+    不用等心跳/会话窗口过期（那要 5~15 分钟，期间看板会骗人）。
+    """
+    try:
+        ppid = os.getppid()
+        return {"host_pid": ppid} if ppid and ppid > 1 else {}
+    except Exception:
+        return {}
 
 
 def http(method, path, body=None):
@@ -94,6 +107,7 @@ def touch_lead(pid):
             sid = _session_id()
             if sid:
                 body["thread_id"] = sid
+            body.update(_host())
             http("POST", f"/api/projects/{pid}/heartbeat", body)
     except Exception as e:  # 心跳失败不能挡住查状态
         log("touch_lead failed:", e)
@@ -116,8 +130,13 @@ def summarize(p):
                  "已超支" if st.get("over_budget") else ""])) or "未设截止"),
              f"任务 {s['total']}｜完成 {s['done']}｜进行中 {s['doing']}｜待验收 {s['review']}｜阻塞 {s['blocked']}", "",
              "## 成员"]
+    rs = st.get("resume") or {}
+    if rs.get("needs_reconcile"):
+        lines.insert(0, f"⚠ {rs['orphans']} 条 doing 任务的人已经不在岗（不是在进行中）。"
+                        f"先调 resume_brief 处置，别当它还活着等。")
     for m in st["members"]:
-        state = {"working": "工作中", "idle": "空闲", "blocked": "阻塞", "offline": "离线"}[m["state"]]
+        state = {"working": "工作中", "idle": "空闲", "blocked": "阻塞",
+                 "stale": "僵住（任务没回收）", "offline": "离线"}.get(m["state"], m["state"])
         model = f"　模型 {m['model']}" if m.get("model") else ""
         if m.get("effort"):
             model += f"／{m['effort']}"
@@ -179,6 +198,9 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "string", "description": "项目名或 id，留空取最近一个"}},
      "_meta": {"ui": {"resourceUri": UI_URI}}}},
+    {"name": "resume_brief", "description": "交班简报：新会话/重启 Codex 之后必须先调这一个。回答「谁断了、断了多久、哪条 doing 任务烂尾、先处置什么」。不调就派活，会对着已经停掉的子代理空等",
+     "inputSchema": {"type": "object", "properties": {
+         "project": {"type": "string", "description": "项目名或 id，留空取最近一个"}}}},
     {"name": "open_board", "description": "返回看板链接，用于在 Codex 面板里打开；不传 project 打开全部项目总览",
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "string", "description": "项目名或 id，留空=总览"}}}},
@@ -215,7 +237,7 @@ TOOLS = [
          "milestone": {"type": "string", "description": "阶段"},
          "depends_on_title": {"type": "string", "description": "前置任务标题，无则空字符串"}},
      "required": ["title", "assignee", "estimate"]}},
-    {"name": "add_member", "description": "加一个员工（AI 子代理或真人）。模型必须由用户确认：留空＝跟随当前会话模型（默认、无额外消耗）；只有用户明确要求「给某人指定某模型」时才传 model/effort，禁止由负责人自行分配",
+    {"name": "add_member", "description": "加一个员工（AI 子代理或真人）。编制已成型时必须先 request_staff_change 拿用户批准，再把审批单 id 当 approval_id 传进来——没有审批单会被拒。模型必须由用户确认：留空＝跟随当前会话模型（默认、无额外消耗）；只有用户明确要求「给某人指定某模型」时才传 model/effort，禁止由负责人自行分配",
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "string"},
          "name": {"type": "string", "description": "姓名，建议「岗位 · 名字」"},
@@ -225,7 +247,7 @@ TOOLS = [
          "effort": {"type": "string", "description": "留空＝模型默认档位。仅当用户明确要求时填写，且必须在该模型真实支持的档位内"},
          "model_confirmed": {"type": "boolean", "description": "只有用户亲口确认「给这个成员用指定模型」后才传 true；服务端会拒绝未经确认的 model"},
          "capacity": {"type": "integer", "minimum": 1},
-         "size_approved": {"type": "boolean", "description": "仅在用户确认扩编（>5 人）后传 true"}}, "required": ["name"]}},
+         "approval_id": {"type": "string", "description": "已批准的编制审批单 id（staff_requests 里的 id）。编制成型后没有它加不了人"}}, "required": ["name"]}},
     {"name": "set_member_model", "description": "项目总监专用：调整某个员工使用的模型与思考档位。模型必须真实存在，档位必须是该模型支持的；留空 model 表示跟随当前会话模型。用户提出调整后再调用",
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "string"},
@@ -377,6 +399,13 @@ def call(name, args):
             s = p["stats"]
             lines.append(f"- **{p['name']}** {s['overall']}%｜完成 {s['done']}/{s['total']}｜"
                          f"进行中 {s['doing']}｜阻塞 {s['blocked']}｜{len(p['roles'])} 岗位 / {s['members']} 人")
+        # 新会话第一眼就要看到：有人断了、任务还挂着 doing。
+        # 不提示的话，总监会默认「进行中＝有人在做」，然后空等。
+        stuck = [p["name"] for p in d["projects"] if (p.get("resume") or {}).get("needs_reconcile")]
+        if stuck:
+            lines.append("")
+            lines.append(f"⚠ {'、'.join(stuck)} 有 doing 任务的人已经不在岗。"
+                         "先 resume_brief 处置，再派新活。")
         text = "\n".join(lines)
         first = d["projects"][0]["id"] if d["projects"] else ""
         return text, {"projects": d["projects"], "agg": d["agg"],
@@ -387,6 +416,35 @@ def call(name, args):
         touch_lead(p["id"])
         text, st = summarize(p)
         return text, st
+
+    if name == "resume_brief":
+        p = pick_project(args.get("project", ""))
+        r = http("GET", f"/api/projects/{p['id']}/resume-brief")
+        if not isinstance(r, dict) or r.get("error"):
+            return f"拿不到交班简报：{(r or {}).get('error', '未知错误')}", r
+        lines = [f"# 交班简报 · {r.get('name') or p['name']}",
+                 f"{r['verdict']}",
+                 f"（最后一次有人在干活：{r.get('last_active_at') or '无记录'}）", ""]
+        lead = [x for x in r["team"] if x.get("is_lead")]
+        others = [x for x in r["team"] if not x.get("is_lead")]
+        for x in lead + others:
+            mark = {"working": "●", "blocked": "◐", "stale": "◌", "offline": "○"}.get(x["state"], "?")
+            tail = ""
+            if x["state"] == "working":
+                tail = "在岗"
+            else:
+                tail = (x.get("dead_why") or "不在岗") + (f" · 已断 {x['gone_human']}"
+                                                          if x["gone_for"] >= 0 else "")
+            lines.append(f"{mark} {x['seat']} {x['name']}（{x['role']}）— {tail}")
+            for d in x.get("doing") or []:
+                lines.append(f"    └ {d['title']} · {d['progress']}% · {d['idle_human']}没更新")
+        if r.get("orphans"):
+            lines += ["", f"## 烂尾任务 {len(r['orphans'])} 条（doing 但人不在）"]
+            for o in r["orphans"]:
+                lines.append(f"- {o['task_id']} {o['title']} — {o['assignee']} · {o['why']} · {o['idle_human']}没动")
+        lines += ["", "## 先做这些"] + [f"{i}. {a}" for i, a in enumerate(r["actions"], 1)]
+        lines += ["", "派新活之前先把上面处置完；否则你会对着一批已经停掉的子代理空等。"]
+        return "\n".join(lines), r
 
     if name == "goal_audit":
         p = pick_project(args.get("project", ""))
@@ -478,7 +536,7 @@ def call(name, args):
         p = pick_project(args.get("project", ""))
         who = args.get("members") or []
         r = http("POST", f"/api/projects/{p['id']}/heartbeat",
-                 {"members": who} if who else {})
+                 dict({"members": who} if who else {}, **_host()))
         n = len(r.get("touched") or [])
         tgt = "有进行中任务的人" if not who else "、".join(who)
         text = f"心跳已刷新：{n} 人（{tgt}）"
@@ -571,7 +629,7 @@ def call(name, args):
             "kind": args.get("kind", "agent"), "model": args.get("model", ""),
             "effort": args.get("effort", ""),
             "model_confirmed": bool(args.get("model_confirmed", False)),
-            "size_approved": bool(args.get("size_approved", False)),
+            "approval_id": args.get("approval_id", ""),
             "capacity": int(args.get("capacity", 3))})
         if m.get("model"):
             model = f"，指定模型 {m['model']}" + (f"／{m['effort']}" if m.get("effort") else "")
@@ -687,7 +745,7 @@ def call(name, args):
         if not hit:
             return f"编制里没有「{ref}」。先看 project_status 确认工位号和姓名。", {"error": "member not found"}
         r = http("POST", f"/api/projects/{p['id']}/members/{hit['id']}/bind",
-                 {"thread_id": args["thread_id"], "reason": args.get("reason", "")})
+                 dict({"thread_id": args["thread_id"], "reason": args.get("reason", "")}, **_host()))
         if r.get("error"):
             return "接管失败：" + r["error"], r
         return (f"{hit['seat_label']} {hit['name']} 已接管新会话 {args['thread_id'][:8]}…"

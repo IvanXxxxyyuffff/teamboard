@@ -109,6 +109,7 @@ COLUMNS = ["backlog", "doing", "review", "done", "blocked", "abandoned"]
 COL_LABEL = {"backlog": "待办", "doing": "进行中", "review": "待验收",
              "done": "已完成", "blocked": "阻塞", "abandoned": "已放弃"}
 HEARTBEAT_WINDOW = 300  # 心跳有效期：只有「没有进行中任务」时才用离线判定
+DOING_STALE_SEC = 900   # doing 任务也有保质期：15 分钟既没会话写入也没心跳 = 僵尸任务
 TEAM_CAP = 4  # 默认员工上限（不含项目总监）；与执行器并发槽对齐；超过要走扩编审批
 
 # 时间压力闸：剩余时间跌破这些比例就升级，critical 起强制总监复盘
@@ -290,6 +291,15 @@ def init_db():
             ("members", "roster_state", "TEXT DEFAULT 'active'"),  # active / vacant / swapping
             ("members", "bound_at", "REAL DEFAULT 0"),          # 当前会话何时接管这个工位
             ("members", "bind_count", "INTEGER DEFAULT 1"),     # 接管过几次会话（换人不换工位）
+            # 宿主存活：Codex 退出后子代理不会回调任何东西，光等心跳过期会让看板
+            # 在 5~15 分钟里显示「工作中」。登记宿主 pid + 启动时刻，进程没了当场判死。
+            ("members", "host_pid", "INTEGER DEFAULT 0"),
+            ("members", "host_boot", "TEXT DEFAULT ''"),        # 防 pid 复用：启动时刻不一致＝原进程已死
+            ("members", "last_alive", "REAL DEFAULT 0"),        # 最后一次确认活着的时刻（算断线时长）
+            ("members", "dead_reason", "TEXT DEFAULT ''"),      # process / session / heartbeat
+            # last_seen 会被派活/改状态一起刷新，不能当「在干活」的证据。
+            # beat_at 只由真正的 /heartbeat 写，是工位自己在说「我还活着」。
+            ("members", "beat_at", "REAL DEFAULT 0"),
         ]:
             have = {r["name"] for r in c.execute(f"PRAGMA table_info({tbl})")}
             if col not in have:
@@ -313,10 +323,12 @@ def init_db():
             payload TEXT DEFAULT '{}',
             reason TEXT DEFAULT '',
             status TEXT DEFAULT 'pending',   -- pending / approved / rejected
+            consumed_at REAL DEFAULT 0,      -- 批准只能用一次，防止同一张单反复塞人
             created_at TEXT NOT NULL,
             decided_at TEXT DEFAULT '',
             decided_by TEXT DEFAULT '');
         CREATE INDEX IF NOT EXISTS idx_staff_requests ON staff_requests(project_id, status);
+        -- consumed_at：审批单只能用一次。没有它，同一个批准可以被重复用来塞人。
         """)
         # 一次性迁移：老数据里没标总监的，按名字/岗位认出来。总监不占员工编制。
         c.execute("UPDATE members SET is_lead=1 WHERE is_lead=0 AND"
@@ -326,6 +338,12 @@ def init_db():
         c.execute("DELETE FROM task_sessions WHERE task_id NOT IN (SELECT id FROM tasks)")
         c.execute("DELETE FROM member_threads WHERE project_id NOT IN (SELECT id FROM projects)")
         c.execute("DELETE FROM staff_requests WHERE project_id NOT IN (SELECT id FROM projects)")
+        # 审批单只能用一次：老库补列
+        have = {r["name"] for r in c.execute("PRAGMA table_info(staff_requests)")}
+        if "consumed_at" not in have:
+            c.execute("ALTER TABLE staff_requests ADD COLUMN consumed_at REAL DEFAULT 0")
+        if "decided_by" not in have:
+            c.execute("ALTER TABLE staff_requests ADD COLUMN decided_by TEXT DEFAULT ''")
         # 迁移：老项目没有「承诺登记时刻」，用建项时刻兜底，行为与改动前一致
         for r in c.execute("SELECT id, created_at FROM projects"
                            " WHERE committed_at IS NULL OR committed_at=0").fetchall():
@@ -413,6 +431,62 @@ def check_deliverables(base, spec):
         return True, True, []
     flags = [deliverable_exists(base, q) for q in paths]
     return all(flags), any(flags), [q for q, ok in zip(paths, flags) if not ok]
+
+
+_PROC_CACHE = {"at": 0.0, "map": {}}
+
+
+def proc_boot(pid):
+    """进程启动时刻。pid 会被系统复用，只有启动时刻一致才算「同一个进程」。
+
+    macOS 用 ps，Linux 用 /proc/<pid>/stat 第 22 字段。取不到就返回空串，
+    此时只按 pid 是否存在判断（弱一点，但不会误杀）。
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return ""
+    if pid <= 0:
+        return ""
+    try:
+        if sys.platform.startswith("linux"):
+            with open(f"/proc/{pid}/stat", encoding="utf-8", errors="replace") as f:
+                raw = f.read()
+            # comm 字段带括号且可能含空格，从最后一个 ')' 之后切
+            tail = raw[raw.rfind(")") + 2:].split()
+            return tail[19] if len(tail) > 19 else ""
+        r = subprocess.run(["ps", "-p", str(pid), "-o", "lstart="],
+                           capture_output=True, text=True, timeout=2)
+        return (r.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def proc_alive(pid, boot=""):
+    """进程是否还活着。None = 没登记 pid，无法判断（不要当成死）。"""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return None
+    if pid <= 0:
+        return None
+    key = (pid, boot or "")
+    now = time.time()
+    if now - _PROC_CACHE["at"] >= 5:
+        _PROC_CACHE.update({"at": now, "map": {}})
+    if key in _PROC_CACHE["map"]:
+        return _PROC_CACHE["map"][key]
+    try:
+        os.kill(pid, 0)
+        ok = True
+    except PermissionError:
+        ok = True          # 进程在，只是不归当前用户
+    except OSError:
+        ok = False
+    if ok and boot:
+        ok = (proc_boot(pid) == boot)   # 同一个 pid 但换了一个进程 = 原来那个已经死了
+    _PROC_CACHE["map"][key] = ok
+    return ok
 
 
 def safe_int(v, default=0, lo=None, hi=None):
@@ -1237,7 +1311,7 @@ def decide_retro(rid, b):
 SESS_ROOT = os.path.expanduser("~/.codex/sessions")
 _THREAD_CACHE = {"at": 0.0, "rows": []}
 _LIVE_CACHE = {"at": 0.0, "map": {}}
-SESSION_LIVE_WINDOW = 240   # 会话文件在 4 分钟内有写入 → 这个工位一定有人在跑
+SESSION_LIVE_WINDOW = HEARTBEAT_WINDOW   # 与会话/心跳同一个窗口，别让两个时钟互相打架
 
 
 def session_mtimes(ttl=12, days=2):
@@ -1266,11 +1340,14 @@ def session_mtimes(ttl=12, days=2):
                 out[full] = max(out.get(full, 0.0), mt)
     # 成员表里 thread_id 有的存全量 UUID、有的只存前 8 位（工位绑定用短 id），
     # 两种都要能查到；前缀键取同名会话里最新的一次写入。
-    for k in [k for k in out if "-" in k]:
+    # 注意：前缀只是「查询便利」，不能当成「这个工位还活着」的证据——
+    # 同一个前缀可能命中另一个会话，会把死掉的子代理判活。存活只认全量 UUID。
+    full_keys = {k for k in out if "-" in k}
+    for k in list(full_keys):
         short = k[:8]
         if out.get(short, 0.0) < out[k]:
             out[short] = out[k]
-    _LIVE_CACHE.update({"at": now, "map": out})
+    _LIVE_CACHE.update({"at": now, "map": out, "full": full_keys})
     return out
 
 
@@ -1540,11 +1617,15 @@ def project_state(pid):
             t["prio_why"] = "已在做，占着人（在做的不降到 P3）"
 
     tmap = {t["id"]: t for t in tasks}
+    alive_upd = []      # 本轮确认还在工作的成员，循环结束后一次性落库
     for m in members:
         mine = [t for t in tasks if t["assignee_id"] == m["id"]]
         doing = [t for t in mine if t["status"] == "doing"]
         blocked = [t for t in mine if t["status"] == "blocked"]
         hs = float(m["last_seen"] or 0)
+        # 真心跳：只有 /heartbeat 会写它。派活、改状态刷新的是 last_seen，
+        # 拿 last_seen 判「在干活」会让刚 spawn 就死掉的子代理装活 15 分钟。
+        beat = float(m.get("beat_at") or 0)
         duty = float(m.get("duty_until") or 0)
         m["heartbeat_age"] = max(0, int(now - hs)) if hs > 0 else -1
         m["on_duty"] = duty > now              # 总监派活时登记的在场租约
@@ -1552,10 +1633,21 @@ def project_state(pid):
         # 会话文件在写 = 这个工位确实有人在跑，比心跳可靠（子代理不回调心跳）
         tid0 = (m.get("thread_id") or "").strip()
         sess_mt = session_mtimes().get(tid0) if tid0 else 0.0
+        # 存活只认全量 UUID 的写入时间（前缀命中不算数，见 session_mtimes 的说明）
+        sess_mt_full = sess_mt if (tid0 and tid0 in _LIVE_CACHE.get("full", ())) else 0.0
         m["session_age"] = max(0, int(now - sess_mt)) if sess_mt else -1
-        m["session_live"] = bool(sess_mt) and (now - sess_mt) < SESSION_LIVE_WINDOW
+        m["session_live"] = bool(sess_mt_full) and (now - sess_mt_full) < SESSION_LIVE_WINDOW
+        # 宿主进程探活：Codex 一退出，子代理就再也不会有任何回调，
+        # 只靠心跳/会话窗口会让看板继续显示「工作中」5~15 分钟。
+        # 登记过 pid 的成员，进程没了就当场判死，不等窗口过期。
+        hp = int(m.get("host_pid") or 0)
+        alive = proc_alive(hp, m.get("host_boot") or "")
+        m["host_alive"] = alive                  # None = 没登记 pid，无法判断
+        host_dead = (alive is False)             # 只在「确定死了」时降级，不猜
         m["live"] = (m["on_duty"] or m["session_live"]
-                     or (hs > 0 and (now - hs) < HEARTBEAT_WINDOW))
+                     or (beat > 0 and (now - beat) < HEARTBEAT_WINDOW))
+        if host_dead:
+            m["live"] = False
         m["load"] = len([t for t in mine if t["status"] in ("backlog", "doing", "review", "blocked")])
         # 超载：一个人手里压的活超过他的并发槽（capacity），看板要显式喊出来，
         # 否则「5 个人 20 条任务」看着很忙，实际全堵在一个人身上。
@@ -1595,29 +1687,59 @@ def project_state(pid):
         if blocked:
             m["state"] = "blocked"
             m["state_source"] = "task"
-        elif doing:
+        elif doing and not host_dead and (m["session_live"] or (beat > 0 and (now - beat) < DOING_STALE_SEC)):
             m["state"] = "working"
-            m["state_source"] = "task"
-        elif m["session_live"]:
+            m["state_source"] = "session" if m["session_live"] else "task"
+        elif doing:
+            # 任务还挂在 doing，但会话没写、心跳也没有 = 执行体已经断了，任务没回收
+            m["state"] = "stale"
+            m["state_source"] = "task+stale"
+        elif m["session_live"] and not host_dead:
             # 会话文件正在写 = 这个座位真的在执行。总监通常没有 doing 任务
             # （它的活是调度），只按心跳判会把正在干活的总监显示成摸鱼。
             m["state"] = "working"
             m["state_source"] = "session"
-        elif m["live"]:
+        elif m["live"] and not host_dead:
             m["state"] = "idle"
             m["state_source"] = "heartbeat"
         else:
             m["state"] = "offline"
             m["state_source"] = "heartbeat"
+        # 死因：总监接手时最需要知道的是「人为什么没了」，不是「多久没心跳」
+        if host_dead:
+            m["dead_reason"] = "process"      # 宿主进程退出（Codex 关了）
+        elif doing and m["state"] == "stale":
+            m["dead_reason"] = "session"      # 进程在，但这条会话已经不写了
+        elif m["state"] == "offline":
+            m["dead_reason"] = "heartbeat"
+        else:
+            m["dead_reason"] = ""
         m["working"] = m["state"] == "working"
+        m["stalled"] = m["state"] == "stale"           # 任务挂着、人不在：要单独喊出来
         m["online"] = m["state"] != "offline"          # 在岗 = 不是离线
         m["stale"] = bool(doing) and not m["live"]      # 在干活但没心跳上报
-        last_act = max(hs, sess_mt or 0.0)
+        last_act = max(hs, sess_mt_full or 0.0)
         m["offline_for"] = (max(0, int(now - last_act)) if last_act > 0 else -1) \
             if m["state"] == "offline" else 0
         # 看板只分「工作中 / 摸鱼中」：没在干活的时间统一从这里取，别让前端自己猜
         m["away_for"] = 0 if m["state"] == "working" \
             else (max(0, int(now - last_act)) if last_act > 0 else -1)
+        # 记下「最后一次确实在工作」的时刻。断线时长、交班简报都靠它，
+        # 没有它就只能显示「离线 62m」却答不出「他是什么时候断的」。
+        prev_alive = float(m.get("last_alive") or 0)
+        if prev_alive <= 0:
+            # 老数据没有 last_alive：用手上最硬的一条证据（心跳 / 会话写入）兜底，
+            # 否则断线时长会显示成「无记录」，等于没回答用户的问题。
+            prev_alive = last_act or 0.0
+        m["last_alive"] = prev_alive
+        m["gone_for"] = (max(0, int(now - prev_alive))
+                         if (prev_alive > 0 and m["state"] != "working") else 0)
+        if m["state"] == "working" and (now - prev_alive) > 60:
+            alive_upd.append((now, m["id"]))
+
+    if alive_upd:
+        with db() as c:
+            c.executemany("UPDATE members SET last_alive=? WHERE id=?", alive_upd)
 
     # 会话接管台账：证明「关掉子代理又开一个」是同一把椅子换人，不是新员工
     with db() as c:
@@ -1695,6 +1817,7 @@ def project_state(pid):
         "working": len([m for m in members if m["state"] == "working"]),
         "offline": len([m for m in members if m["state"] == "offline"]),
         "blocked_members": len([m for m in members if m["state"] == "blocked"]),
+        "stalled": len([m for m in members if m["state"] == "stale"]),
         "overall": overall,
         "deliverables": len([t for t in tasks if t["deliverable"]]),
         "delivered": len([t for t in tasks if t["deliverable"] and t["status"] in ("review", "done")]),
@@ -1834,7 +1957,7 @@ def project_state(pid):
                          if elapsed else 0)
         m["idle_pct"] = max(0, 100 - m["util_pct"])
         m["slacking"] = bool(not m.get("is_lead") and elapsed and elapsed > 900
-                             and m["util_pct"] < 20 and m["state"] != "working")
+                             and m["util_pct"] < 20 and m["state"] not in ("working", "stale"))
     team_util = (min(100, round(100.0 * sum(m["time_total"] for m in workers)
                                / (len(workers) * elapsed)))
                  if (workers and elapsed) else 0)
@@ -1926,7 +2049,17 @@ def project_state(pid):
     pending = list_approvals(pid, "pending")
     sreq = list_staff_requests(pid)
     prio_counts = {k: len([t for t in open_tasks if t["prio"] == k]) for k in (1, 2, 3)}
+    # 断线摘要：面板顶部横幅用。全量明细走 /resume-brief，
+    # 这里只留三个数，避免每次轮询都重算一份大对象。
+    orphans = [t for t in tasks if t["status"] == "doing"
+               and next((x for x in members if x["id"] == t["assignee_id"]), {}).get("state") != "working"]
+    last_any = max([float(m.get("last_alive") or 0) for m in members] or [0])
     return {"project": dict(p), "members": members, "tasks": tasks, "stats": stats,
+            "resume": {"orphans": len(orphans),
+                       "not_working": len([m for m in members if m["state"] != "working"]),
+                       "total": len(members),
+                       "gap_sec": int(now - last_any) if last_any > 0 else -1,
+                       "needs_reconcile": bool(orphans)},
             # 配比：总监填的配额 + 实际切出来的条数。看板顶部照这个显示，别让「全 P1」复发
             "priority_ratio": prio_ratio,
             "priority_quota": {"p1": q1, "p2": q12 - q1, "p3": len(open_tasks) - q12},
@@ -2045,7 +2178,7 @@ def ensure_seats(pid=None):
                           " WHERE id=?", (ts, r["id"], r["id"]))
 
 
-def bind_member(pid, mid, thread_id, reason=""):
+def bind_member(pid, mid, thread_id, reason="", host_pid=0, host_boot=""):
     """接管工位：换会话，不换人。
 
     子代理被关闭、重开一个新的，只是换了一段执行会话：
@@ -2077,10 +2210,21 @@ def bind_member(pid, mid, thread_id, reason=""):
         c.execute("INSERT INTO member_threads(id,project_id,member_id,thread_id,bound_at,reason)"
                   " VALUES(?,?,?,?,?,?)",
                   (new_id("thr"), pid, mid, thread_id, now, reason or "接管工位"))
-        c.execute("UPDATE members SET thread_id=?, bound_at=?, bind_count=?, last_seen=?,"
-                  " roster_state=CASE WHEN roster_state IN ('','vacant') THEN 'active'"
-                  "                   ELSE roster_state END WHERE id=?",
-                  (thread_id, now, binds + 1, now, mid))
+        # 绑会话的这一刻 Codex 一定还开着：顺手把宿主进程记下来。
+        # 之后 Codex 一退，这个 pid 就没了，看板当场判死，不用等心跳过期。
+        hp = safe_int(host_pid, 0, 0)
+        boot = (host_boot or proc_boot(hp)) if hp > 0 else ""
+        if hp > 0:
+            c.execute("UPDATE members SET thread_id=?, bound_at=?, bind_count=?, last_seen=?,"
+                      " host_pid=?, host_boot=?, beat_at=?, last_alive=?, dead_reason='',"
+                      " roster_state=CASE WHEN roster_state IN ('','vacant') THEN 'active'"
+                      "                   ELSE roster_state END WHERE id=?",
+                      (thread_id, now, binds + 1, now, hp, boot, now, now, mid))
+        else:
+            c.execute("UPDATE members SET thread_id=?, bound_at=?, bind_count=?, last_seen=?,"
+                      " roster_state=CASE WHEN roster_state IN ('','vacant') THEN 'active'"
+                      "                   ELSE roster_state END WHERE id=?",
+                      (thread_id, now, binds + 1, now, mid))
         log_event(c, pid, "member.rebind", actor=mid,
                   payload=f"工位#{int(m['seat_no'] or 0)} {old or '(空)'} → {thread_id}")
     return {"ok": True, "id": mid, "name": m["name"], "thread_id": thread_id,
@@ -2139,7 +2283,8 @@ def create_staff_request(pid, b):
             "seat_no": int((m or {}).get("seat_no") or 0),
             "summary": f"申请{verb}：{m['name'] if m else b.get('name','')} · {b.get('reason','')}",
             "need_approval": True,
-            "next": "等用户在看板上点批准（或 POST /api/projects/<pid>/staff-requests/<id>/decide）"}
+            "next": "等用户在会话里点批准（approval_inbox 会把卡片推到对话里）；"
+                    "批准后用这个 id 作为 approval_id 继续"}
 
 
 def decide_staff_request(rid, b):
@@ -2168,7 +2313,7 @@ def decide_staff_request(rid, b):
     if kind == "add":
         mb = dict(payload)
         # 用户已经批过这张扩编单，落库时不该再被 TEAM_CAP 挡一次
-        mb.update({"seat_approved": True, "size_approved": True,
+        mb.update({"approval_id": rid,
                    "model_confirmed": True, "kind": "agent"})
         mb.setdefault("name", "未命名员工")
         out = add_member(pid, mb)
@@ -2229,16 +2374,43 @@ def list_staff_requests(pid):
 
 def _roster_gate(pid, b):
     """新建员工的闸：编制已成型时，只有审批过的申请才许进人。"""
-    if b.get("seat_approved") or b.get("size_approved"):
+    ok, why = _approved_staff(pid, b, "add")
+    if ok:
         return None
     with db() as c:
         active = c.execute("SELECT COUNT(*) FROM members WHERE project_id=?"
                            " AND COALESCE(roster_state,'active')<>'vacant'", (pid,)).fetchone()[0]
     if active <= 0:
         return None      # 空团队：第一波建班子走计划审批，这里放行
-    return {"error": "编制已经成型，不能随手加人：员工会一直在变，看板就失去意义。"
-                     "要加人调 request_staff_change(kind='add', ...)，用户在面板批准后才落库。",
+    head = "编制已经成型，不能随手加人：员工会一直在变，看板就失去意义。"
+    if why != "缺 approval_id":
+        head = f"审批单不能用：{why}。"
+    return {"error": head +
+                     "要加人调 request_staff_change(kind='add', ...)，用户在会话里批准后，"
+                     "把返回的审批单 id 作为 approval_id 传进来才落库。",
             "need_approval": True, "staff_request_required": True}
+
+
+def _approved_staff(pid, b, kind):
+    """校验这张编制审批单：必须已批准、没被用过、类型和项目都对得上。
+
+    以前这里只认一个 size_approved=true 的布尔位——模型随手传一个就能绕过
+    用户审批。现在改成认审批单 id，批准一次只能落一个人。
+    """
+    rid = (b.get("approval_id") or "").strip()
+    if not rid:
+        return False, "缺 approval_id"
+    with db() as c:
+        r = c.execute("SELECT * FROM staff_requests WHERE id=?", (rid,)).fetchone()
+    if not r or r["project_id"] != pid:
+        return False, f"没有这张审批单：{rid}"
+    if r["kind"] != kind:
+        return False, f"审批单类型是 {r['kind']}，不是 {kind}"
+    if r["status"] != "approved":
+        return False, f"这张审批单还没批准（{r['status']}）"
+    if float(r["consumed_at"] or 0) > 0:
+        return False, "这张审批单已经用过了，一件事一张单"
+    return True, ""
 
 
 def add_member(pid, b):
@@ -2258,7 +2430,7 @@ def add_member(pid, b):
             same = c.execute("SELECT id, name, seat_no FROM members WHERE project_id=? AND name=?",
                              (pid, nm)).fetchone()
         if same:
-            if b.get("seat_approved") or b.get("size_approved"):
+            if _approved_staff(pid, b, "add")[0]:
                 return next(m for m in project_state(pid)["members"] if m["id"] == same["id"])
             return {"error": f"编制里已经有「{same['name']}」（工位 #{int(same['seat_no'] or 0)}）。"
                              f"关掉子代理再开一个新的，不是换员工，是换会话："
@@ -2274,10 +2446,11 @@ def add_member(pid, b):
         n = c.execute("SELECT COUNT(*) FROM members WHERE project_id=?"
                       " AND COALESCE(is_lead,0)=0"
                       " AND COALESCE(roster_state,'active')='active'", (pid,)).fetchone()[0]
-    if n >= TEAM_CAP and not b.get("size_approved"):
+    if n >= TEAM_CAP and not _approved_staff(pid, b, "add")[0]:
         return {"error": f"员工上限 {TEAM_CAP} 人（不含项目总监），要开到第 {n+1} 个员工"
-                         f"必须先让用户审批：问过用户再带 size_approved=true 提交（或走计划审批）",
-                "field": "capacity", "need_approval": True}
+                         "必须先让用户审批：走 request_staff_change(kind='add')，"
+                         "用户批准后把审批单 id 当 approval_id 传进来",
+                "field": "capacity", "need_approval": True, "staff_request_required": True}
     mid = new_id("mem")
     now = time.time()
     with db() as c:
@@ -2297,6 +2470,10 @@ def add_member(pid, b):
                       " VALUES(?,?,?,?,?,?)",
                       (new_id("thr"), pid, mid, tid, now, "入职即绑定"))
         log_event(c, pid, "member.joined", actor=mid, payload=b.get("name", ""))
+        rid = (b.get("approval_id") or "").strip()
+        if rid:
+            c.execute("UPDATE staff_requests SET consumed_at=? WHERE id=? AND consumed_at=0",
+                      (now, rid))
     return next(m for m in project_state(pid)["members"] if m["id"] == mid)
 
 
@@ -2530,6 +2707,121 @@ def update_task(tid, b):
     return next((x for x in project_state(pid)["tasks"] if x["id"] == tid), None)
 
 
+def _hm(sec):
+    """秒 → 人话（1小时2分）。"""
+    sec = max(0, int(sec))
+    if sec < 60:
+        return f"{sec}秒"
+    if sec < 3600:
+        return f"{sec // 60}分钟"
+    return f"{sec // 3600}小时{(sec % 3600) // 60}分"
+
+
+DEAD_WHY = {"process": "宿主进程已退出（Codex 关了）",
+            "session": "会话已停止写入",
+            "heartbeat": "长时间没有心跳"}
+
+
+def resume_brief(pid):
+    """交班简报：新会话开工前，总监必须先看这一份。
+
+    Codex 一退出子代理就停了，但数据库里还留着「doing」。新会话里如果总监
+    不知道这件事，会以为人还在干、继续等，整条链空转几十分钟。
+    这里把「谁断了、断多久、哪条任务烂尾、该怎么处置」一次摊开。
+    """
+    st = project_state(pid)
+    if not st:
+        return None
+    now = time.time()
+    tasks = st["tasks"]
+
+    doing_by = {}
+    for t in tasks:
+        if t["status"] == "doing" and t.get("assignee_id"):
+            doing_by.setdefault(t["assignee_id"], []).append(t)
+
+    team, orphans = [], []
+    for m in st["members"]:
+        alive = float(m.get("last_alive") or 0)
+        gone = int(now - alive) if alive > 0 else -1
+        doing = doing_by.get(m["id"], [])
+        idle_of = {t["id"]: max(0, int(now - _epoch(t.get("updated_at") or t.get("created_at"))))
+                   for t in doing}
+        team.append({
+            "id": m["id"], "seat": m.get("seat_label"), "name": m["name"],
+            "role": m.get("role", ""), "state": m["state"],
+            "state_source": m.get("state_source", ""),
+            "dead_reason": m.get("dead_reason", ""),
+            "dead_why": DEAD_WHY.get(m.get("dead_reason"), ""),
+            "host_alive": m.get("host_alive"),
+            "gone_for": gone, "gone_human": _hm(gone) if gone >= 0 else "无记录",
+            "is_lead": bool(m.get("is_lead")),
+            "doing": [{"id": t["id"], "title": t["title"],
+                       "progress": safe_int(t.get("progress"), 0, 0, 100),
+                       "idle_sec": idle_of.get(t["id"], 0),
+                       "idle_human": _hm(idle_of.get(t["id"], 0))} for t in doing],
+        })
+        if m["state"] != "working":
+            for t in doing:
+                orphans.append({
+                    "task_id": t["id"], "title": t["title"],
+                    "assignee": m["name"], "seat": m.get("seat_label") or "",
+                    "progress": safe_int(t.get("progress"), 0, 0, 100),
+                    "idle_sec": idle_of.get(t["id"], 0),
+                    "idle_human": _hm(idle_of.get(t["id"], 0)),
+                    "why": DEAD_WHY.get(m.get("dead_reason"), "状态不明"),
+                })
+
+    # 最后一次「确实有人在干活」= 全队 last_alive 的最大值
+    last_any = max([float(m.get("last_alive") or 0) for m in st["members"]] or [0])
+    gap = int(now - last_any) if last_any > 0 else -1
+    dead = [x for x in team if x["state"] != "working"]
+    up = [x for x in team if x["state"] == "working"]
+
+    longest = max([x["gone_for"] for x in dead if x["gone_for"] >= 0] or [0])
+    gap_text = "刚刚" if 0 <= gap < 60 else (_hm(gap) if gap >= 0 else "无记录")
+    if not st["members"]:
+        verdict = "这个项目还没有员工。先建团队再派活。"
+    elif not dead:
+        verdict = f"全队 {len(up)} 人都在线上，没有断线员工。"
+    elif not up:
+        verdict = (f"全队 {len(team)} 人都不在岗，最后一次有人干活是 {gap_text}前。"
+                   + (f" {len(orphans)} 条 doing 任务烂尾。" if orphans else ""))
+    elif not orphans:
+        verdict = (f"{len(up)}/{len(team)} 人在岗；{len(dead)} 人不在岗，"
+                   f"最长已断 {_hm(longest)}。没有 doing 任务被挂住。")
+    else:
+        verdict = (f"{len(dead)}/{len(team)} 人不在岗（最长已断 {_hm(longest)}），"
+                   f"{len(orphans)} 条 doing 任务烂尾，需要先处置再派新活。")
+
+    actions = []
+    for x in team:
+        if x["state"] == "stale" and x["doing"]:
+            actions.append(f"{x['seat']} {x['name']}：{x['doing'][0]['title']}"
+                           f"（{x['doing'][0]['idle_human']}未更新）——先决定续做还是转 blocked")
+    if orphans:
+        actions.append("烂尾任务不要直接改 done：能续就重新拉起子代理并 bind_member 接管同一工位；"
+                       "不能续就改 blocked 并写清卡点")
+    if not up:
+        actions.append("当前没有人在岗：先按原编制把子代理拉起来并 bind_member，再谈新任务")
+    if not actions:
+        actions.append("无需处置，直接继续原计划")
+
+    return {
+        "project_id": pid, "name": st["project"].get("name", ""), "generated_at": now_iso(),
+        "gap_sec": gap, "gap_human": _hm(gap) if gap >= 0 else "无记录",
+        "last_active_at": (datetime.fromtimestamp(last_any).astimezone().isoformat(timespec="seconds")
+                           if last_any > 0 else ""),
+        "working": len(up), "not_working": len(dead), "total": len(team),
+        "needs_reconcile": bool(orphans),
+        "verdict": verdict,
+        "orphans": orphans,
+        "team": team,
+        "actions": actions,
+        "note": "这是事实快照，不是建议：先处置 orphans，再派新活。",
+    }
+
+
 def update_member(mid, b):
     # 会话登记走 bind_member：要留接管台账，不能当成普通字段覆盖
     if (b.get("thread_id") or "").strip():
@@ -2547,6 +2839,15 @@ def update_member(mid, b):
         m = c.execute("SELECT * FROM members WHERE id=?", (mid,)).fetchone()
         if not m:
             return None
+        # 编制是用户批准过的：改人名/岗位等于换人，必须走审批。
+        # 允许改的只有「状态类」字段——模型、容量、备注这些不动编制的。
+        locked = [k for k in ("name", "role")
+                  if k in b and (b[k] or "").strip() != (m[k] or "").strip()]
+        if locked and not b.get("staff_approved"):
+            return {"error": f"「{m['name']}」的{'、'.join(locked)}不能直接改——换人/改岗位要走审批。"
+                             "调 request_staff_change(kind='replace', member=..., name=..., role=..., reason=...) "
+                             "提交给用户，批准后才会落到工位上。",
+                    "need_approval": True, "staff_request_required": True, "field": locked[0]}
         err = check_model(b.get("model", m["model"])) or check_effort(b.get("model", m["model"]), b.get("effort", m["effort"]))
         if not err and b.get("model") and b["model"] != m["model"] and not b.get("model_confirmed"):
             err = "改模型必须先由用户确认，确认后带 model_confirmed=true"
@@ -2568,12 +2869,36 @@ def update_member(mid, b):
     return next((x for x in project_state(pid)["members"] if x["id"] == mid), None)
 
 
-def heartbeat(mid):
+def heartbeat(mid, b=None):
+    """刷心跳；带 pid 的会顺手登记宿主进程，Codex 一退出就能当场判死。
+
+    pid 必须由调用方传（MCP server 自己的 pid 不是 Codex 的），
+    子代理上报时传它所在那个 Codex 进程；不传就维持原来的纯时间窗口判定。
+    """
+    b = b or {}
     with db() as c:
-        if not c.execute("SELECT 1 FROM members WHERE id=?", (mid,)).fetchone():
+        row = c.execute("SELECT * FROM members WHERE id=?", (mid,)).fetchone()
+        if not row:
             return None
-        c.execute("UPDATE members SET last_seen=? WHERE id=?", (time.time(), mid))
-    return {"ok": True, "id": mid, "ts": now_iso()}
+        ts = time.time()
+        sets, vals = ["last_seen=?"], [ts]
+        try:
+            hp = int(b.get("pid") or 0)
+        except (TypeError, ValueError):
+            hp = 0
+        boot = (b.get("boot") or proc_boot(hp)) if hp > 0 else ""
+        # 进程已经死了还刷心跳，等于用一条假消息把断线时间往后推。
+        # 这种心跳只登记 pid（好让状态机判死），不算「活着」。
+        alive = proc_alive(hp, boot) if hp > 0 else None
+        if alive is not False:
+            sets += ["beat_at=?", "last_alive=?"]
+            vals += [ts, ts]
+        if hp > 0:
+            sets += ["host_pid=?", "host_boot=?", "dead_reason=''"]
+            vals += [hp, boot]
+        c.execute(f"UPDATE members SET {','.join(sets)} WHERE id=?", vals + [mid])
+    return {"ok": True, "id": mid, "ts": now_iso(),
+            "host_alive": alive}
 
 
 def heartbeat_project(pid, b):
@@ -2619,8 +2944,13 @@ def heartbeat_project(pid, b):
             hit = [h["id"] for h in hit if h["id"]]
             unknown = []
         ts = time.time()
+        hp = safe_int(b.get("host_pid"), 0, 0)
         for mid in hit:
             c.execute("UPDATE members SET last_seen=? WHERE id=?", (ts, mid))
+        if hp > 0 and lead:
+            # 总监的宿主进程：Codex 一退，这条 pid 就没了，总监当场显示断线
+            c.execute("UPDATE members SET host_pid=?, host_boot=? WHERE id=?",
+                      (hp, b.get("host_boot") or proc_boot(hp), lead["id"]))
     return {"ok": True, "project_id": pid, "touched": hit,
             "unknown": unknown, "ts": now_iso()}
 
@@ -2690,6 +3020,8 @@ def overview():
                        "members", "online", "overall", "delivered", "deliverables")},
             "roles": [{"role": r["role"], "owners": r["owners"], "total": r["total"],
                        "progress": r["progress"]} for r in st["roles"]],
+            # 首页卡片也要能看出「有人断了、任务还挂着」——点进去才发现就太晚了
+            "resume": st.get("resume"),
             "members": [{"id": m["id"], "name": m["name"], "role": m["role"],
                          "state": m["state"], "kind": m["kind"], "progress": m["progress"],
                          "current_task": m["current_task"],
@@ -2982,6 +3314,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, model_catalog())
         if p == "/api/overview":
             return self._send(200, overview())
+        m = re.fullmatch(r"/api/projects/([\w]+)/resume-brief", p)
+        if m:
+            r = resume_brief(m.group(1))
+            return self._send(200 if r else 404, r or {"error": "no such project"})
         m = re.fullmatch(r"/api/projects/([\w]+)", p)
         if m:
             st = project_state(m.group(1))
@@ -3102,7 +3438,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400 if isinstance(r, dict) and "error" in r else 201, r)
         m = re.fullmatch(r"/api/projects/([\w]+)/members/([\w]+)/bind", p)
         if m:
-            r = bind_member(m.group(1), m.group(2), b.get("thread_id", ""), b.get("reason", ""))
+            r = bind_member(m.group(1), m.group(2), b.get("thread_id", ""), b.get("reason", ""),
+                            b.get("host_pid") or 0, b.get("host_boot") or "")
             return self._send(400 if r.get("error") else 200, r)
         m = re.fullmatch(r"/api/projects/([\w]+)/staff-requests", p)
         if m:
@@ -3130,7 +3467,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200 if r else 404, r or {"error": "no member"})
         m = re.fullmatch(r"/api/members/([\w]+)/heartbeat", p)
         if m:
-            r = heartbeat(m.group(1))
+            r = heartbeat(m.group(1), b)
             return self._send(200 if r else 404, r or {"error": "no member"})
         m = re.fullmatch(r"/api/projects/([\w]+)/heartbeat", p)
         if m:

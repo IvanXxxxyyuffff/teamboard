@@ -618,9 +618,17 @@ function acceptChip(){
   return `<span class="chip ${g>=t?"ok":"blocked"}" title="逐条判定结果（unknown 不计入分母）">
     验收 <b>${g}/${t}</b> 绿</span>`;
 }
-const STATE_LABEL={idle:"摸鱼中",working:"工作中",blocked:"卡住·摸鱼中",offline:"摸鱼中"};
+const STATE_LABEL={idle:"摸鱼中",working:"工作中",stale:"僵住",blocked:"卡住·摸鱼中",offline:"摸鱼中"};
+// 状态来源：同样是「工作中」，会话在写和任务挂着是两回事，看板不能把它们画成一个样子
+const SRC_TAG={session:"会话",task:"任务","task+stale":"任务未回收"};
+function stateText(m){
+  const base=STATE_LABEL[m.state]||m.state;
+  const tag=SRC_TAG[m.state_source]||"";
+  return (m.state==="working"||m.state==="stale")&&tag?`${base}(${tag})`:base;
+}
+
 // 阻塞不是摸鱼：状态仍是两态，但把「卡住」单拎出来，否则看板会把真卡点藏进摸鱼队列
-const STATE_TIP={idle:"没在干活",working:"有进行中任务",blocked:"任务被标阻塞",offline:"没在干活"};
+const STATE_TIP={idle:"没在干活",working:"有进行中任务",stale:"任务还挂在 doing，但会话没写、心跳也停了：执行体断了，任务没回收",blocked:"任务被标阻塞",offline:"没在干活"};
 const COL_COLOR={backlog:"#8b9694",doing:"#ccf556",review:"#b6a3ff",done:"#4fe3a3",blocked:"#ff7d6c",abandoned:"#6d7b78"};
 const COLORS=["#ccf556","#4fe3a3","#b6a3ff","#6ec8ff","#f5c04a","#ff9f7d","#8fe0d0","#e0c2ff"];
 const PREVIEW=3;
@@ -773,8 +781,9 @@ function render(){
     ${acceptChip()}`;
   document.getElementById("onlineTxt").textContent=
     `工作中 ${s.working||0}`
+    + ((s.stalled)?` · 僵住 ${s.stalled}`:"")
     + ((s.blocked_members)?` · 卡住 ${s.blocked_members}`:"")
-    + ` · 摸鱼中 ${(s.members||0)-(s.working||0)-(s.blocked_members||0)}`;
+    + ` · 摸鱼中 ${(s.members||0)-(s.working||0)-(s.blocked_members||0)-(s.stalled||0)}`;
   document.getElementById("capTxt").textContent=`${s.workers??s.members}/${S.team_cap||5}`;
   document.getElementById("capTxt").title=`员工 ${s.workers??s.members}/${S.team_cap||5}（项目总监不占编制）`;
   document.getElementById("plead").textContent=p.lead||"你";
@@ -1318,7 +1327,7 @@ function teamRender(){
     <div class="mem${m.is_lead?" lead":""}" onclick="openMember('${m.id}')" title="点开看他在做什么、卡在哪">
       <div class="big" style="background:${colorOf(m.name)}">${esc(m.name[0])}</div>
       <div class="info">
-        <div class="n">${esc(m.name)}<span class="badge ${m.state}">${STATE_LABEL[m.state]}</span>
+        <div class="n">${esc(m.name)}<span class="badge ${m.state}" title="${esc(STATE_TIP[m.state]||"")}">${stateText(m)}</span>
           <span class="load${m.overload&&!m.is_lead?" hot":""}" title="${m.is_lead?`总监手里还有 ${m.load} 条未收工任务（总监不占执行并发槽，这里是提醒别再往它身上压活）`:(m.overload?`手里 ${m.load} 条活，并发槽只有 ${m.capacity}：活压在一个人身上，排期会失真`:`${m.load} 条任务 / ${m.capacity} 个并发槽`)}">${m.is_lead?`${m.load} 条在手`:`${m.load}/${m.capacity}`}${m.overload&&!m.is_lead?" 超载":""}</span></div>
         <div class="r">${esc(m.role)}${m.kind==="agent"?" · AI 子代理":""}</div>
         ${m.kind==="agent"?`<div class="r" style="margin-top:4px">${m.model
@@ -1385,7 +1394,7 @@ function openMember(id){
         <div class="sub"><span class="srole">${esc(m.role||"—")}${
             m.model?` · ${esc(m.model)}${m.effort?" "+esc(m.effort):""}`:""}</span>
           · <b class="sstate" style="color:${m.state==="working"?"var(--lime)":"var(--ink-3)"}">${
-            STATE_LABEL[m.state]}${m.state!=="working"&&m.away_for>=0?` ${fmtDur(m.away_for)}`:""}</b></div>
+            stateText(m)}${m.state!=="working"&&m.away_for>=0?` ${fmtDur(m.away_for)}`:""}</b></div>
       </div>
     </div>
     <div class="dsum ${sumCls}">

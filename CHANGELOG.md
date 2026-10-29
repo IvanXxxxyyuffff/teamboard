@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.3.0 — liveness that tells the truth
+
+The board used to show `working` for subagents that had already died with the host app.
+After Codex quit, the director would come back, see "进行中", and wait on nobody.
+
+### Added
+- `GET /api/projects/<id>/resume-brief` and the `resume_brief` MCP tool: who is gone,
+  for how long, which `doing` tasks are orphaned, and what to do first.
+- `members.host_pid` / `host_boot` / `last_alive` / `dead_reason`: the MCP server registers
+  the Codex process it was spawned from, so a dead host is detected **immediately** instead of
+  after the 5–15 minute heartbeat window.
+- `members.beat_at`: only `/heartbeat` writes it. `last_seen` is also touched by dispatching and
+  status edits, so using it as "is working" evidence made a subagent that died right after spawn
+  look busy for 15 minutes.
+- `stale` state and `state_source` (`session` / `task` / `task+stale`) surfaced in both UIs.
+- `staff_requests.consumed_at`: a hire approval can only be used once.
+
+### Changed
+- A staff approval is now redeemed by id (`approval_id`), not by a `size_approved` boolean the
+  caller could simply set. Renaming a seat member or changing their role is rejected too —
+  that is a `replace` request.
+- `board_overview` / `project_status` prepend a warning when `doing` tasks have no live owner.
+
 ## 0.2.0 — first public cut
 
 Board service synced with the development branch: seat-stable rosters, approval-gated hiring,
