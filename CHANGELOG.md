@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.2 — a rejected approval stops coming back
+
+Two places lied after a rejection.
+
+**The card reappeared.** The panel renders approvals from the tool-result snapshots the host
+replays, and it kept a purely in-memory queue. Reject an approval, the queue drains, and the
+next replayed snapshot pushes the same card back as if still pending. The panel now asks the
+server before rendering (`/api/approvals/<id>`, `staff-requests`, `retros`) and drops anything
+that is no longer `pending`; approvals that were decided are remembered in `localStorage`, so a
+replayed snapshot cannot resurrect them. If the check itself fails, the card stays — losing a
+real approval is worse than one extra prompt. A failed POST now writes the reason onto the
+card in red instead of a toast that scrolls out of view, so a rejected click can no longer look
+like nothing happened.
+
+**The empty shell stayed on the home board.** A project is created before its plan is approved.
+Reject the plan and you are left with a project that has zero tasks and zero members, pinned to
+the front page forever. `/api/overview` now skips shells with no tasks, no members and nothing
+pending. The row is kept, so resubmitting the plan still lands on the same project — the card
+comes back the moment tasks exist.
+
 ## 0.3.1 — a blocked seat can be stale too
 
 A task marked `blocked` does not mean someone is watching it. When the executor is gone

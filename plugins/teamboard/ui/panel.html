@@ -1030,6 +1030,51 @@ function toast(msg,kind){
 const API="http://127.0.0.1:8787";
 let APP=null;
 let PENDING=[];            // 待审批队列：会话里推过来几项就依次弹几项
+/* 已决 / 稍后集合：批过、驳过的单子落 localStorage。
+   宿主会把上一次工具结果的 structuredContent 再推一遍，队列里没有它就会「复活」——
+   这是「点了驳回，卡还在」的根因。 */
+const DECIDED=(()=>{
+  try{ return new Set(JSON.parse(localStorage.getItem("tb.decided")||"[]")); }
+  catch(e){ return new Set(); }
+})();
+const SNOOZED=new Set();   // 「稍后再说」只在本次面板存活期内压制，重开面板还会提醒
+function aprKey(p){ const id=p&&p.data&&p.data.id; return id?((p.kind||"")+":"+id):""; }
+function isDecided(p){ const k=aprKey(p); return !!k&&DECIDED.has(k); }
+function markDecided(p){
+  const k=aprKey(p); if(!k) return;
+  DECIDED.add(k);
+  try{ localStorage.setItem("tb.decided", JSON.stringify([...DECIDED].slice(-300))); }catch(e){}
+}
+function dropPending(p){
+  const k=aprKey(p); if(!k) return;
+  PENDING=PENDING.filter(x=>aprKey(x)!==k);
+}
+/* 服务端是唯一真源。true=还待批 / false=已被处理 / "unknown"=查不到（不吞卡，交给用户兜底） */
+async function stillPending(p){
+  const id=p&&p.data&&p.data.id, pid=(p&&p.data&&p.data.project_id)||PID;
+  if(!id) return "unknown";
+  try{
+    if(p.kind==="plan"){
+      const a=await api("GET",`/api/approvals/${id}`);
+      if(!a||a.error||!a.status) return "unknown";
+      return a.status==="pending";
+    }
+    if(p.kind==="staff"){
+      const r=await api("GET",`/api/projects/${pid}/staff-requests`);
+      const it=(((r&&r.staff_requests)||[]).find(x=>x.id===id));
+      if(!it||!it.status) return "unknown";
+      return it.status==="pending";
+    }
+    if(p.kind==="retro"){
+      const r=await api("GET",`/api/projects/${pid}/retros`);
+      const list=(r&&(r.retros||r))||[];
+      const it=(Array.isArray(list)?list:[]).find(x=>x&&x.id===id);
+      if(!it||!it.status) return "unknown";
+      return it.status==="submitted";
+    }
+  }catch(e){ return "unknown"; }
+  return "unknown";
+}
 function notePending(sc){
   if(!sc) return;
   const pid=sc.project_id||(sc.pending&&sc.pending.project_id)
@@ -1039,6 +1084,8 @@ function notePending(sc){
     if(!p||!p.kind) return;
     const id=p.data&&p.data.id;
     if(PENDING.some(x=>x.kind===p.kind&&(x.data&&x.data.id)===id)) return;
+    if(isDecided(p)) return;                     // 批过/驳过的，快照再回放也不入队
+    const k=aprKey(p); if(k&&SNOOZED.has(k)) return;
     PENDING.push(p);
   };
   if(Array.isArray(sc.pending)) sc.pending.forEach(push);
@@ -1047,10 +1094,23 @@ function notePending(sc){
   if(sc.staff_request&&sc.staff_request.id) push({kind:"staff",data:sc.staff_request});
   if(sc.retro) push({kind:"retro",data:sc.retro});
 }
-function applyPending(){
-  if(!PENDING.length) return;
-  const p=PENDING[0];
-  renderApCard(p);                 // 会话里只渲染这一张卡，不铺整个看板
+let APPLYING=false, APPLY_AGAIN=false;
+async function applyPending(){
+  if(APPLYING){ APPLY_AGAIN=true; return; }
+  APPLYING=true;
+  try{
+    do{
+      APPLY_AGAIN=false;
+      while(PENDING.length){
+        const p=PENDING[0];
+        if(isDecided(p)){ PENDING.shift(); continue; }
+        const live=await stillPending(p);   // 渲染前先问服务端：已处理的直接丢
+        if(live===false){ markDecided(p); PENDING.shift(); continue; }
+        renderApCard(p);                    // 会话里只渲染这一张卡，不铺整个看板
+        return;
+      }
+    }while(APPLY_AGAIN);
+  }finally{ APPLYING=false; }
 }
 function nextPending(){ PENDING.shift(); setTimeout(applyPending,150); }
 
@@ -1113,7 +1173,9 @@ function renderApCard(p){
   shellMode("card");
 }
 function cardLater(){
-  PENDING.shift();
+  const k=aprKey(APC);
+  if(k) SNOOZED.add(k);              // 本次面板内不再弹，重开面板还会提醒
+  dropPending(APC);
   if(PENDING.length){ applyPending(); return; }
   document.getElementById("apc-done").textContent="已收起，稍后在「团队看板」里还能批";
 }
@@ -1129,11 +1191,13 @@ async function cardDecide(decision){
   if(APC.kind==="plan") body.confirm_over_cap=decision==="approve"&&!!APC.data.over_cap;
   if(APC.kind==="staff") body.by="user";
   const el=document.getElementById("apc-done");
-  if(el) el.textContent="提交中…";
+  if(el){ el.style.color=""; el.textContent="提交中…"; }
   const r=await api("POST",path,body);
   if(!r||r.error){
-    if(el) el.textContent="";
-    toast("没提交成功："+((r&&r.error)||"看板服务没响应"));
+    // 失败必须写在卡上：toast 在长卡里常被翻不到，用户以为「点了没反应」
+    const why=(r&&r.error)||(r&&r.need_confirm?"要先勾选扩编确认":"看板服务没响应（点一下刷新再试）");
+    if(el){ el.style.color="var(--coral)"; el.textContent="没提交成功："+why; }
+    toast("没提交成功："+why);
     return;
   }
   if(r.apply_errors&&r.apply_errors.length){
@@ -1141,7 +1205,8 @@ async function cardDecide(decision){
   } else {
     toast(decision==="approve"?"已批准":"已驳回", "ok");
   }
-  PENDING.shift();
+  // 决策已落库：这张单从此刻起不许再出现（宿主会把旧快照再推一遍）
+  markDecided(APC); dropPending(APC);
   if(PENDING.length){ applyPending(); return; }
   document.getElementById("apcard").innerHTML=
     `<div class="apc"><div class="apc-h"><span class="apc-tag">${decision==="approve"?"已批准":"已驳回"}</span>

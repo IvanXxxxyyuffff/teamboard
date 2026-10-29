@@ -3010,6 +3010,11 @@ def overview():
     out = []
     for p in rows:
         st = project_state(p["id"])
+        # 空壳项目不上首页：只建了壳、计划还没批（或刚被驳回）时任务和成员都是 0，
+        # 留着只会让首页多一张「0 任务 0 人」的卡片。行不删——总监改完计划重新提交，
+        # 批准后任务落库，卡片自然回来。
+        if not st["tasks"] and not st["members"] and not (st.get("pending_approvals") or []):
+            continue
         out.append({
             "id": p["id"], "name": p["name"], "goal": p.get("goal", ""),
             "lead": p.get("lead", ""), "deadline": p.get("deadline", ""),

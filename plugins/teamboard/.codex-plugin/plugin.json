@@ -1,6 +1,6 @@
 {
   "name": "teamboard",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "TeamBoard: an in-chat kanban for AI teams - who is working on what, how far along, and where it is stuck.",
   "author": {
     "name": "TeamBoard contributors"
