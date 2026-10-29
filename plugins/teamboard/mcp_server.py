@@ -4,6 +4,7 @@ import json, os, sys, time, urllib.request, urllib.error
 
 from _autostart import boot as _boot
 BASE = _boot()        # 探测已在跑的看板，没有就起一个（开源版无 launch agent）
+BILI = os.environ.get("BILI_URL", "http://127.0.0.1:8790").rstrip("/")
 NAME = "teamboard"
 try:
     with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION"),
@@ -49,6 +50,21 @@ def http(method, path, body=None):
                 "status": 0, "offline": True}
     except TimeoutError:
         return {"error": f"看板服务 {BASE} 15s 没响应（可能在跑长事务）", "status": 0}
+
+
+def bili_http(method, path):
+    """调 billion-context 代理的 __bili 端点（GET only，只读）。"""
+    req = urllib.request.Request(BILI + path, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            raw = r.read()
+        return json.loads(raw) if raw[:1] in (b"{", b"[") else raw.decode()
+    except urllib.error.URLError as e:
+        return {"error": f"bili 代理 {BILI} 连不上（{getattr(e, 'reason', e)}）。"
+                         f"先启动：export PATH=$HOME/.local/bin:$PATH && bili start --port 8790 &",
+                "status": 0, "offline": True}
+    except TimeoutError:
+        return {"error": f"bili 代理 {BILI} 15s 没响应", "status": 0}
 
 
 def pick_project(name):
@@ -170,8 +186,18 @@ TOOLS = [
          "path": {"type": "string", "description": "以 /api 开头的路径"},
          "body": {"type": "object", "description": "请求体"}},
          "required": ["path"]}},
+    {"name": "bili_api", "title": "bili 数据代理",
+     "description": "内部工具：代理访问 billion-context 代理的 __bili 端点（健康检查 / overview / sessions / status），供内嵌看板取数",
+     "inputSchema": {"type": "object", "properties": {
+         "path": {"type": "string", "description": "以 /__bili 开头的路径，如 /__bili/overview 或 /__bili/sessions"}},
+         "required": ["path"]}},
     {"name": "teamboard_panel", "title": "团队看板",
      "description": "把团队看板作为内容标签页打开：我的团队 / 每个员工在做什么 / 进度 / 卡点",
+     "inputSchema": {"type": "object", "properties": {}},
+     "_meta": {"ui": {"resourceUri": UI_URI, "visibility": ["model", "app"]},
+               "openai/ui": {"entrypoints": [{"type": "thread"}, {"type": "global"}]}}},
+    {"name": "bili_panel", "title": "bili 看板",
+     "description": "打开 billion-context 上下文管理看板：会话数 / token 用量 / 缓存命中率 / 压缩块 / 节省量。数据源是 bili 代理（默认 127.0.0.1:8790）。",
      "inputSchema": {"type": "object", "properties": {}},
      "_meta": {"ui": {"resourceUri": UI_URI, "visibility": ["model", "app"]},
                "openai/ui": {"entrypoints": [{"type": "thread"}, {"type": "global"}]}}},
@@ -356,6 +382,37 @@ TOOLS = [
 
 
 def call(name, args):
+    if name == "bili_api":
+        path = args.get("path") or "/__bili/overview"
+        if not path.startswith("/__bili"):
+            return "rejected", {"data": None, "error": "only /__bili paths"}
+        try:
+            out = bili_http("GET", path)
+        except Exception as e:
+            return "error", {"data": None, "error": str(e)}
+        return "ok", {"data": out}
+
+    if name == "bili_panel":
+        d = bili_http("GET", "/__bili/overview").get("overview") or bili_http("GET", "/__bili/overview")
+        agg = d.get("byProtocol", [])
+        lines = [
+            f"## 📊 billion-context 看板", "",
+            f"| 指标 | 数值 |",
+            f"|---|---|",
+            f"| 会话 | {d.get('live', 0)} live / {d.get('sessions', 0)} total |",
+            f"| 总请求数 | {d.get('requests', 0):,} |",
+            f"| 输入 token | {d.get('inputTokens', 0):,} |",
+            f"| 缓存命中 | {d.get('cachedTokens', 0):,}（{d.get('hitPct', 0)}%） |",
+            f"| 压缩块 | {d.get('blocks', 0):,} |",
+            f"| 节省 token | {d.get('tokensSaved', 0):,} |",
+            f"| 实际花费 | ${d.get('costUsdTotal', 0):.2f} |",
+            f"| 压缩节省 | ${d.get('savedUsdTotal', 0):.2f} |", "",
+            f"健康度：{'✅ HEALTHY' if d.get('hitPct', 0) >= 85 else '⚠️ 低于 85%，查归因'}",
+            "",
+            f"Web UI: {BILI}/__bili/",
+        ]
+        return "\n".join(lines), {"bili": d, "bili_url": BILI + "/__bili/"}
+
     if name == "tb_api":
         m = (args.get("method") or "GET").upper()
         path = args.get("path") or "/"

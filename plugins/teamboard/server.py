@@ -6,7 +6,7 @@ TeamBoard v2 — 项目看板 / 团队状态 / 交付物清单 / 进度报告
 import argparse, glob, json, os, re, sqlite3, subprocess, sys, time, uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -2867,6 +2867,20 @@ MIME = {".html": "text/html; charset=utf-8", ".js": "application/javascript; cha
         ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png"}
 
 
+class Board(ThreadingHTTPServer):
+    """HTTPServer.server_bind() 会做一次 getfqdn(host) 反向解析；DNS 不通时卡死。
+
+    看板只监听本机，server_name 用 IP 就够，不需要那段可能阻塞几十秒的解析。
+    """
+    daemon_threads = True
+
+    def server_bind(self):
+        super(HTTPServer, self).server_bind()   # 只做 TCPServer 的 bind，不碰 getfqdn
+        host, port = self.server_address[:2]
+        self.server_name = host
+        self.server_port = port
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "TeamBoard/" + VERSION
 
@@ -3253,11 +3267,11 @@ def main():
     a = ap.parse_args()
     if a.db:
         DB_PATH = os.path.abspath(os.path.expanduser(a.db))
+    print(f"TeamBoard v2 -> http://{a.host}:{a.port}  (db: {DB_PATH})", flush=True)
     init_db()
     ensure_seats()          # 老库补工位号：编制要能一眼看出「谁是谁」
     backfill_sessions()
-    srv = ThreadingHTTPServer((a.host, a.port), Handler)
-    print(f"TeamBoard v2 → http://{a.host}:{a.port}  (db: {DB_PATH})", flush=True)
+    srv = Board((a.host, a.port), Handler)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

@@ -913,6 +913,7 @@ container holding the app. Specify either width or maxWidth, and either height o
         <button data-v="progress" onclick="setView('progress')">进度</button>
         <button data-v="deliv" onclick="setView('deliv')">交付物</button>
         <button data-v="feed" onclick="setView('feed')">动态</button>
+        <button data-v="bili" onclick="setView('bili')">bili</button>
       </div>
       <div class="tools" id="boardtools">
         <button class="tool" onclick="toggleAllCols(true)">全部展开</button>
@@ -925,6 +926,7 @@ container holding the app. Specify either width or maxWidth, and either height o
     <div class="view" id="view-progress" style="display:none"></div>
     <div class="view" id="view-deliv" style="display:none"></div>
     <div class="view" id="view-feed" style="display:none"></div>
+    <div class="view" id="view-bili" style="display:none"></div>
   </section>
   <aside>
     <div class="aside-h"><b>成员状态</b><span class="cap" id="capTxt">0/5</span><span class="live" id="onlineTxt">在线 0/0</span></div>
@@ -2150,12 +2152,82 @@ function feedRender(){
 function setView(v){
   view=v;
   document.querySelectorAll(".tabs button").forEach(b=>b.classList.toggle("on",b.dataset.v===v));
-  ["board","goal","time","progress","deliv","feed"].forEach(k=>
+  ["board","goal","time","progress","deliv","feed","bili"].forEach(k=>
     document.getElementById("view-"+k).style.display=k===v?"":"none");
   document.getElementById("boardtools").style.display=v==="board"?"":"none";
   if(v==="time")timeRender(); if(v==="progress")progressRender(); if(v==="deliv")delivRender(); if(v==="feed")feedRender();
   if(v==="goal")goalRender();
+  if(v==="bili")biliRender();
 }
+/* ---- bili 看板：billion-context 上下文压缩统计（经 bili_api 代理取数，沙箱 CSP 不放行直连） ---- */
+let BILI_CACHE=null;
+async function biliRender(){
+  const host=document.getElementById("view-bili");
+  if(!host) return;
+  if(BILI_CACHE && Date.now()-BILI_CACHE.at<5000){ biliDraw(host,BILI_CACHE.data); return; }
+  host.innerHTML='<div class="empty">加载 bili 数据…</div>';
+  let data=null;
+  try{
+    if(APP){
+      const r=await APP.callServerTool({name:"bili_api",arguments:{path:"/__bili/overview"}});
+      const sc=r&&r.structuredContent; if(sc&&sc.data)data=sc.data;
+    }else{
+      const r=await fetch("http://127.0.0.1:8790/__bili/overview").then(x=>x.json());
+      data=r;
+    }
+  }catch(e){}
+  if(!data||!data.overview){ host.innerHTML='<div class="empty">bili 代理没跑。启动：bili start --port 8790 &amp;</div>'; return; }
+  BILI_CACHE={at:Date.now(),data};
+  biliDraw(host,data);
+}
+function biliDraw(host,d){
+  const o=d.overview||{}, by=o.byProtocol||[];
+  const hit=o.hitPct??0, healthy=hit>=85;
+  const fmt=n=>Number(n||0).toLocaleString();
+  const usd=n=>"$"+Number(n||0).toFixed(2);
+  host.innerHTML=`<div style="padding:18px 22px">
+    <h3 style="margin:0 0 4px">billion-context · 上下文压缩</h3>
+    <div style="font-size:12px;color:var(--ink-3);margin-bottom:14px">
+      会话 ${o.live??0} live / ${o.sessions??0} total ·
+      <span style="color:${healthy?"var(--mint)":"var(--coral)"};font-weight:650">
+        ${healthy?"✅ HEALTHY":"⚠️ 低于 85%，查归因"}</span>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px">
+      ${[
+        ["总请求数", fmt(o.requests)],
+        ["输入 token", fmt(o.inputTokens)],
+        ["缓存命中", fmt(o.cachedTokens)],
+        ["命中率", hit+"%"],
+        ["压缩块", fmt(o.blocks)],
+        ["节省 token", fmt(o.tokensSaved)],
+        ["实际花费", usd(o.costUsdTotal)],
+        ["压缩节省", usd(o.savedUsdTotal)],
+      ].map(([k,v])=>`<div style="background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:12px 14px">
+        <div style="font-size:11px;color:var(--ink-3);margin-bottom:4px">${k}</div>
+        <div style="font-size:19px;font-weight:680;color:var(--ink-1);font-family:var(--mono)">${v}</div>
+      </div>`).join("")}
+    </div>
+    ${by.length?`<div style="margin-bottom:14px">
+      <div style="font-size:12px;color:var(--ink-3);margin-bottom:8px;font-weight:650">按协议</div>
+      ${by.map(p=>`<div style="display:flex;gap:12px;align-items:center;padding:6px 0;border-bottom:1px solid var(--line);font-size:12.5px">
+        <b style="color:var(--ink-1);min-width:70px">${p.protocol||"-"}</b>
+        <span style="color:var(--ink-2)">${p.sessions??0} 会话 · ${fmt(p.requests)} 请求</span>
+        <span style="margin-left:auto;color:${(p.hitPct??0)>=85?"var(--mint)":"var(--amber)"}">命中 ${p.hitPct??0}%</span>
+        <span style="color:var(--ink-3)">${p.folds??0} 折叠</span>
+      </div>`).join("")}
+    </div>`:""}
+    <div style="display:flex;gap:10px;align-items:center;font-size:12px;color:var(--ink-3)">
+      <button class="tool" onclick="biliRender()" style="padding:5px 12px">刷新</button>
+      <span>Web UI: <a href="javascript:void(0)" onclick="openBiliWeb()" style="color:var(--lime)">${"http://127.0.0.1:8790/__bili/"}</a></span>
+    </div>
+  </div>`;
+}
+function openBiliWeb(){
+  const url="http://127.0.0.1:8790/__bili/";
+  if(APP&&APP.openLink){APP.openLink({url}).catch(()=>{});return;}
+  window.open(url,"_blank");
+}
+
 function exportReport(){
   const url=`${API}/api/projects/${PID}/report?download=1`;
   if(APP&&APP.openLink){ APP.openLink({url}).catch(()=>{}); return; }
