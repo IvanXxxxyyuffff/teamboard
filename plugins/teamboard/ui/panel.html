@@ -964,7 +964,7 @@ function stateText(m){
 }
 
 // 阻塞不是摸鱼：状态仍是两态，但把「卡住」单拎出来，否则看板会把真卡点藏进摸鱼队列
-const STATE_TIP={idle:"没在干活",working:"有进行中任务",stale:"任务还挂在 doing，但会话没写、心跳也停了：执行体断了，任务没回收",blocked:"任务被标阻塞",offline:"没在干活"};
+const STATE_TIP={idle:"没在干活",working:"有进行中任务",stale:"任务还挂在 doing/blocked，但执行体已经断了（会话不写、心跳停、或宿主进程没了）：不是卡住，是没人守",blocked:"任务被标阻塞",offline:"没在干活"};
 const COL_COLOR={backlog:"#8b9694",doing:"#ccf556",review:"#b6a3ff",done:"#4fe3a3",blocked:"#ff7d6c",abandoned:"#6d7b78"};
 const COLORS=["#ccf556","#4fe3a3","#b6a3ff","#6ec8ff","#f5c04a","#ff9f7d","#8fe0d0","#e0c2ff"];
 const PREVIEW=3;

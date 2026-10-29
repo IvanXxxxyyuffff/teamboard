@@ -1682,11 +1682,21 @@ def project_state(pid):
         m["progress"] = round(sum(safe_int(t.get("progress"), 0, 0, 100) for t in mine) / len(mine)) if mine else 0
         m["time_total"] = sum(safe_int(t.get("total_time"), 0, 0) for t in mine)
         m["time_running"] = sum(safe_int(t.get("elapsed"), 0, 0) for t in mine)
+        # 阻塞也要有人守着：任务标了 blocked，但执行体早断了，那就不叫「卡住」，
+        # 叫「僵住」——卡点是任务写的，僵住是人没了。这两件事必须分开显示，
+        # 否则总监会以为有人在盯这个卡点，其实是空的。
+        blocked_dead = bool(blocked) and (
+            host_dead
+            or (bool(sess_mt_full) and (now - sess_mt_full) > DOING_STALE_SEC)
+            or (beat > 0 and (now - beat) > DOING_STALE_SEC))
         # 状态以「任务事实」为准：有 doing 任务就是工作中，心跳只用于判定空闲/离线。
         # 子代理跑在 Codex 里，不会稳定回调心跳，所以不能用它否决进行中的任务。
-        if blocked:
+        if blocked and not blocked_dead:
             m["state"] = "blocked"
             m["state_source"] = "task"
+        elif blocked_dead:
+            m["state"] = "stale"
+            m["state_source"] = "task+stale"
         elif doing and not host_dead and (m["session_live"] or (beat > 0 and (now - beat) < DOING_STALE_SEC)):
             m["state"] = "working"
             m["state_source"] = "session" if m["session_live"] else "task"
@@ -1708,7 +1718,7 @@ def project_state(pid):
         # 死因：总监接手时最需要知道的是「人为什么没了」，不是「多久没心跳」
         if host_dead:
             m["dead_reason"] = "process"      # 宿主进程退出（Codex 关了）
-        elif doing and m["state"] == "stale":
+        elif m["state"] == "stale":
             m["dead_reason"] = "session"      # 进程在，但这条会话已经不写了
         elif m["state"] == "offline":
             m["dead_reason"] = "heartbeat"

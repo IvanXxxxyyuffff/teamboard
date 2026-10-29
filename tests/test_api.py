@@ -122,6 +122,16 @@ def main():
               and dead[0]["dead_reason"] == "process", dead)
         check("orphan doing task is surfaced for handover",
               any(o["task_id"] == task["id"] for o in brief.get("orphans", [])), brief.get("orphans"))
+
+        # 阻塞也要有人守着：任务标 blocked，但执行体早断了，就不是「卡住」而是「僵住」
+        code, blocked = call(base, "PATCH", f"/api/tasks/{task['id']}",
+                             {"status": "blocked", "blocked_reason": "等用户确认"})
+        code, state = call(base, "GET", f"/api/projects/{pid}")
+        dead = [x for x in state["members"] if x["id"] == mem2["id"]][0]
+        check("a blocked seat whose host died reads as stale, not blocked",
+              dead["state"] == "stale" and dead["dead_reason"] == "process", dead["state"])
+        check("the blocked reason survives the downgrade",
+              "等用户确认" in (dead.get("stuck") or ""), dead.get("stuck"))
     finally:
         kill_board(base)
         try:

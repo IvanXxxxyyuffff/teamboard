@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1 — a blocked seat can be stale too
+
+A task marked `blocked` does not mean someone is watching it. When the executor is gone
+(host process dead, session silent past the window, or no heartbeat), the seat now reads
+`stale` instead of `blocked`. The `blocked_reason` stays attached, so you see both
+"nobody is here" and "this is what they were stuck on".
+
+Prefix-only `thread_id`s are deliberately **not** used for this downgrade: an 8-character
+prefix can match two different sessions, and guessing "dead" from an ambiguous id is worse
+than showing `blocked`.
+
 ## 0.3.0 — liveness that tells the truth
 
 The board used to show `working` for subagents that had already died with the host app.
