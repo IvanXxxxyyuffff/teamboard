@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.3 — a blocked task is not a blocked person
+
+The state machine put `blocked` ahead of everything, so a seat with a blocked task read
+`卡住·摸鱼中` even while its session file was being written every few seconds. Three subagents
+running in Codex, board says "working 0". A live session now wins: the seat reads `working`
+with `state_source=session+blocked`, and the blocker rides along on the member row
+(`blocked_count` / `blocked_title` / `blocked_reason`) instead of hiding in the drawer.
+
+**Unseated agents are now visible.** When a session shares the parent of this project's own
+seats, was written in the last 10 minutes, and is bound to no project, the member list opens
+with what it is: a subagent that is running but has no seat. It reports the short id and how
+long ago it was last written — no name guessing. The fix is to `add_member` it, which is also
+what makes it schedulable.
+
+`session_mtimes()` now also invalidates on directory mtime, so a subagent that was just spawned
+shows up immediately instead of after the 12-second cache. `TEAMBOARD_SESSIONS` overrides the
+rollout directory (`~/.codex/sessions` by default) so tests can fabricate a live session
+without writing into the real one.
+
 ## 0.3.2 — a rejected approval stops coming back
 
 Two places lied after a rejection.

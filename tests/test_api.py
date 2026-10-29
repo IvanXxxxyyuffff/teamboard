@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Board API smoke test: boots server.py on a throwaway port + DB, no side effects."""
-import json, subprocess, sys, pathlib
+import json, os, subprocess, sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _util import PLUGIN, PYTHON, free_port, temp_home, env_for, call, wait_health, kill_board
 
@@ -132,6 +132,29 @@ def main():
               dead["state"] == "stale" and dead["dead_reason"] == "process", dead["state"])
         check("the blocked reason survives the downgrade",
               "等用户确认" in (dead.get("stuck") or ""), dead.get("stuck"))
+
+        # 会话还在写 = 人在干活。blocked 是任务状态，不是人的状态：
+        # 实测 trigger_state / quest3_detector 每几秒写一次会话，却曾被画成「卡住·摸鱼中」
+        call(base, "POST", f"/api/members/{mem2['id']}/heartbeat", {"pid": os.getpid()})
+        from datetime import datetime
+        d = datetime.now()
+        day = home / "sessions" / f"{d:%Y}" / f"{d:%m}" / f"{d:%d}"
+        day.mkdir(parents=True, exist_ok=True)
+        tid = "01a2b3c4-1111-7222-8333-444455556666"
+        (day / f"rollout-2026-01-01T00-00-00-{tid}.jsonl").write_text(
+            json.dumps({"type": "session_meta",
+                        "payload": {"id": tid, "parent_thread_id": ""}}) + "\n",
+            encoding="utf-8")
+        call(base, "POST", f"/api/projects/{pid}/members/{mem2['id']}/bind",
+             {"thread_id": tid})
+        code, state = call(base, "GET", f"/api/projects/{pid}")
+        live = [x for x in state["members"] if x["id"] == mem2["id"]][0]
+        check("a blocked task with a live session reads as working",
+              live["state"] == "working" and live["state_source"] == "session+blocked",
+              (live["state"], live.get("state_source")))
+        check("the blocked title rides along on the member row",
+              live.get("blocked_count") == 1 and live.get("blocked_title"),
+              (live.get("blocked_count"), live.get("blocked_title")))
     finally:
         kill_board(base)
         try:

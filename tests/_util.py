@@ -26,6 +26,8 @@ def env_for(home, port, catalog=True):
     e["TEAMBOARD_HOME"] = str(home)
     e["TEAMBOARD_DB"] = str(home / "board.db")
     e["TEAMBOARD_PORT"] = str(port)
+    # 会话目录指到临时 home：存活判定要读 rollout 文件，别去扫用户真实的 ~/.codex
+    e["TEAMBOARD_SESSIONS"] = str(home / "sessions")
     if catalog:
         e["TEAMBOARD_CATALOG"] = str(ROOT / "tests" / "fixtures" / "models.json")
     return e

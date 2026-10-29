@@ -959,6 +959,9 @@ const STATE_LABEL={idle:"摸鱼中",working:"工作中",stale:"僵住",blocked:"
 const SRC_TAG={session:"会话",task:"任务","task+stale":"任务未回收"};
 function stateText(m){
   const base=STATE_LABEL[m.state]||m.state;
+  // 人还在干活、只是手上有条卡住的任务：徽章就说「工作中」，
+  // 卡点单独一行红字写清楚，别把两件事挤进一个徽章里
+  if(m.state_source==="session+blocked") return base;
   const tag=SRC_TAG[m.state_source]||"";
   return (m.state==="working"||m.state==="stale")&&tag?`${base}(${tag})`:base;
 }
@@ -1923,7 +1926,15 @@ async function decideApproval(decision){
 
 /* ---------------- 成员 ---------------- */
 function teamRender(){
-  document.getElementById("team").innerHTML=S.members.map(m=>`
+  // 在跑却没落座的子代理：Codex 里「已开启 3」，这里只画 2 个工位，用户看到的就是对不上。
+  // 不猜名字，只报会话短 id 和「多久前还在写」，让它去找总监登记。
+  const un=S.unseated||[];
+  const unseatedWarn=un.length?`<div style="margin:6px 10px 12px;padding:9px 11px;border:1px solid rgba(255,125,108,.35);background:rgba(255,125,108,.07);border-radius:10px;font-size:12px;line-height:1.55">
+      <b style="color:var(--coral)">⚠ ${un.length} 个子代理在跑，但没有工位</b>
+      <div style="color:var(--ink-3);margin-top:2px">${un.map(o=>`<code>${esc(o.short)}</code> · ${o.age_min} 分钟前还在写`).join("　")}</div>
+      <div style="color:var(--ink-3);margin-top:2px">看板看不见它就派不了活、记不了时：让总监用 add_member 登记进编制</div>
+    </div>`:"";
+  document.getElementById("team").innerHTML=unseatedWarn+S.members.map(m=>`
     <div class="mem${m.is_lead?" lead":""}" onclick="openMember('${m.id}')" title="点开看他在做什么、卡在哪">
       <div class="big" style="background:${colorOf(m.name)}">${esc(m.name[0])}</div>
       <div class="info">
@@ -1937,6 +1948,7 @@ function teamRender(){
           : `<span class="badge" style="border-style:dashed">跟随会话模型</span>`}</div>`:""}
         <div class="now">${m.current_task?"▶ "+esc(m.current_task):
           (m.state==="blocked"?"⛔ 有阻塞任务":"— 无进行中任务")}</div>
+        ${m.blocked_count&&m.state!=="blocked"?`<div class="now" style="color:var(--coral)" title="${esc(m.blocked_reason||"总监没写卡点原因")}">⛔ ${esc(m.blocked_count>1?`${m.blocked_count} 条阻塞 · ${m.blocked_title}`:m.blocked_title)}</div>`:""}
         <div class="r tline${m.state!=="working"?" off":""}">${
           m.state==="working"?`计时 ${fmtDur(m.time_running)} · 累计 ${fmtDur(m.time_total)}`
           :`摸鱼 ${m.away_for>=0?fmtDur(m.away_for):"—"}${m.time_total?` · 累计 ${fmtDur(m.time_total)}`:""}`

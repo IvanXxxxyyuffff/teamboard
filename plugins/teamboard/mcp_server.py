@@ -11,7 +11,7 @@ try:
         VERSION = _f.read().strip() or "2.1.0"
 except OSError:
     VERSION = "2.1.0"
-UI_URI = "ui://teamboard/panel11"   # v4: 面板改为经 MCP 代理取数（沙箱 CSP 禁 connect-src http）
+UI_URI = "ui://teamboard/panel12"   # v4: 面板改为经 MCP 代理取数（沙箱 CSP 禁 connect-src http）
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_FILE = os.path.join(HERE, "ui", "panel.html")
 UI_MIME = "text/html;profile=mcp-app"

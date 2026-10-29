@@ -110,6 +110,9 @@ COL_LABEL = {"backlog": "待办", "doing": "进行中", "review": "待验收",
              "done": "已完成", "blocked": "阻塞", "abandoned": "已放弃"}
 HEARTBEAT_WINDOW = 300  # 心跳有效期：只有「没有进行中任务」时才用离线判定
 DOING_STALE_SEC = 900   # doing 任务也有保质期：15 分钟既没会话写入也没心跳 = 僵尸任务
+# 总监在 Codex 里开了子代理却没给工位：这些会话和本项目工位同属一个父会话，
+# 10 分钟内还在写 = 现在真的有人在跑，只是看板上没有它的位置
+UNSEATED_LIVE_SEC = 600
 TEAM_CAP = 4  # 默认员工上限（不含项目总监）；与执行器并发槽对齐；超过要走扩编审批
 
 # 时间压力闸：剩余时间跌破这些比例就升级，critical 起强制总监复盘
@@ -1308,9 +1311,10 @@ def decide_retro(rid, b):
     return out
 
 
-SESS_ROOT = os.path.expanduser("~/.codex/sessions")
+# 会话目录可覆盖：测试要造一条「正在写」的会话，不该往用户真实目录里扔文件
+SESS_ROOT = os.environ.get("TEAMBOARD_SESSIONS") or os.path.expanduser("~/.codex/sessions")
 _THREAD_CACHE = {"at": 0.0, "rows": []}
-_LIVE_CACHE = {"at": 0.0, "map": {}}
+_LIVE_CACHE = {"at": 0.0, "map": {}, "sig": None}
 SESSION_LIVE_WINDOW = HEARTBEAT_WINDOW   # 与会话/心跳同一个窗口，别让两个时钟互相打架
 
 
@@ -1321,14 +1325,21 @@ def session_mtimes(ttl=12, days=2):
     这里只 glob 最近两天的日期目录、只取 mtime、不读内容，12 秒缓存，成本可忽略。
     """
     now = time.time()
-    if now - _LIVE_CACHE["at"] < ttl:
+    # 目录 mtime 变了（新开了一个子代理 → 新出现一个 rollout 文件）就立刻重扫，
+    # 否则新工位最多要等 12 秒才被看见，用户会以为「刚开的员工没上板」。
+    today0 = datetime.now()
+    dirs = [os.path.join(SESS_ROOT, f"{(today0 - timedelta(days=i)):%Y}",
+                         f"{(today0 - timedelta(days=i)):%m}",
+                         f"{(today0 - timedelta(days=i)):%d}") for i in range(days)]
+    try:
+        sig = tuple(os.path.getmtime(d) if os.path.isdir(d) else 0.0 for d in dirs)
+    except OSError:
+        sig = None
+    if now - _LIVE_CACHE["at"] < ttl and _LIVE_CACHE.get("sig") == sig:
         return _LIVE_CACHE["map"]
     out = {}
-    today = datetime.now()
-    for i in range(days):
-        d = today - timedelta(days=i)
-        pat = os.path.join(SESS_ROOT, f"{d:%Y}", f"{d:%m}", f"{d:%d}", "*.jsonl")
-        for p in glob.glob(pat):
+    for d in dirs:
+        for p in glob.glob(os.path.join(d, "*.jsonl")):
             try:
                 mt = os.path.getmtime(p)
             except OSError:
@@ -1347,7 +1358,7 @@ def session_mtimes(ttl=12, days=2):
         short = k[:8]
         if out.get(short, 0.0) < out[k]:
             out[short] = out[k]
-    _LIVE_CACHE.update({"at": now, "map": out, "full": full_keys})
+    _LIVE_CACHE.update({"at": now, "map": out, "full": full_keys, "sig": sig})
     return out
 
 
@@ -1671,6 +1682,11 @@ def project_state(pid):
                             for d in doing]
         m["stuck"] = ((blocked[0].get("blocked_reason") or "已标阻塞（未写原因）")
                       if blocked else (_waits_on(doing[0]) if doing else ""))
+        # 有阻塞任务时，不管人是「工作中」还是「卡住」，成员行上都要看得到卡点，
+        # 不能只藏在抽屉里
+        m["blocked_count"] = len(blocked)
+        m["blocked_title"] = blocked[0]["title"] if blocked else ""
+        m["blocked_reason"] = (blocked[0].get("blocked_reason") or "") if blocked else ""
         m["thread_id"] = (m.get("thread_id") or "").strip()
         # 工位：员工身份是「椅子」，会话是坐在椅子上的人。换人不换椅子。
         m["seat_no"] = int(m.get("seat_no") or 0)
@@ -1691,7 +1707,12 @@ def project_state(pid):
             or (beat > 0 and (now - beat) > DOING_STALE_SEC))
         # 状态以「任务事实」为准：有 doing 任务就是工作中，心跳只用于判定空闲/离线。
         # 子代理跑在 Codex 里，不会稳定回调心跳，所以不能用它否决进行中的任务。
-        if blocked and not blocked_dead:
+        # 卡的是任务，不是人：会话文件这一秒还在写，就说明这个人正在干活
+        # （实测 trigger_state / quest3_detector 每几秒写一次会话，却被画成「卡住·摸鱼中」）
+        if blocked and not blocked_dead and m["session_live"] and not host_dead:
+            m["state"] = "working"
+            m["state_source"] = "session+blocked"
+        elif blocked and not blocked_dead:
             m["state"] = "blocked"
             m["state_source"] = "task"
         elif blocked_dead:
@@ -2058,6 +2079,26 @@ def project_state(pid):
 
     pending = list_approvals(pid, "pending")
     sreq = list_staff_requests(pid)
+    # 「已开启 3 个子代理，看板只有 2 个工位」= 用户眼里的对不上。
+    # 判定只认三条事实：跟本项目工位同一个父会话、10 分钟内还在写、没被任何项目登记。
+    unseated = []
+    try:
+        rows = scan_threads(days=2, limit=400)
+        seat_ids = {m["thread_id"] for m in members if m.get("thread_id")}
+        mine_parents = {r.get("parent") for r in rows
+                        if r.get("id") in seat_ids and r.get("parent")}
+        with db() as c:
+            bound = {r["thread_id"] for r in
+                     c.execute("SELECT thread_id FROM members WHERE thread_id<>''")
+                     if r["thread_id"]}
+        for r in rows:
+            if r.get("parent") not in mine_parents:      continue
+            if r.get("id") in bound:                     continue
+            if now - r.get("mtime", 0) > UNSEATED_LIVE_SEC: continue
+            unseated.append({"id": r["id"], "short": r["id"][:8],
+                             "age_min": r.get("age_min", 0)})
+    except Exception:                                     # noqa: BLE001
+        unseated = []                                     # 扫不到就不报，宁缺勿假
     prio_counts = {k: len([t for t in open_tasks if t["prio"] == k]) for k in (1, 2, 3)}
     # 断线摘要：面板顶部横幅用。全量明细走 /resume-brief，
     # 这里只留三个数，避免每次轮询都重算一份大对象。
@@ -2092,6 +2133,8 @@ def project_state(pid):
             "criteria_total": len([x for x in crits if x["status"] in ("green", "red")]),
             "criteria_all": len(crits), "blocker": blocker,
             "pending_approvals": pending, "team_cap": TEAM_CAP,
+            # 在跑却没落座的子代理：看板不能假装它们不存在，也不能假装它们在编
+            "unseated": unseated,
             "roles": role_rows, "milestones": milestones,
             "resource_conflicts": conflicts,
             "goal_violations": viol[:200],
