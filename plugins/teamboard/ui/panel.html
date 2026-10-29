@@ -1053,6 +1053,21 @@ function idleBanner(){
     </div>`);
   }
   const B=S.board||{};
+  // 对齐：在跑的人挂的是哪一条。idle 绿了也可能整队都在账外干活。
+  const AL=S.align||{};
+  if(AL.ok===false){
+    const bits=[];
+    if((AL.unlogged||[]).length) bits.push("在跑没挂号 "+(AL.unlogged||[]).slice(0,4)
+      .map(x=>`${esc(x.name)}(${esc(x.human||"刚上线")})`).join("、"));
+    if((AL.ghost||[]).length) bits.push("任务主人已停 "+(AL.ghost||[]).slice(0,3)
+      .map(x=>`${esc(x.name)}·${esc((x.task||"").slice(0,12))}`).join("、"));
+    if((AL.nosession||[]).length) bits.push("有活没绑会话 "+(AL.nosession||[]).slice(0,3)
+      .map(x=>esc(x.name)).join("、"));
+    rows.push(`<div class="idleb bad">
+      <span>⛔ <b>团队没对齐看板</b>　${bits.join("；")}</span>
+      <span class="more" title="先 update_task(status='doing')，再 member_duty(on=true)">怎么修</span>
+    </div>`);
+  }
   if(B.derail){
     rows.push(`<div class="idleb warn">
       <span>⚠ <b>脱轨 ${esc(B.human)}</b>　总监 ${esc(B.human)}没碰过计划，

@@ -131,6 +131,28 @@ def _idle_line(st):
             f"手里未收工 {i.get('open_tasks')} 条")
 
 
+def _align_line(st):
+    """「在跑的人挂的是哪一条」。idle 绿了也可能整队都在账外干活。"""
+    a = st.get("align") or {}
+    if a.get("ok", True):
+        if not a.get("checked"):
+            return ""
+        return f"对齐：{a['checked']} 个工位都在看板上挂号 ✅"
+    bits = []
+    if a.get("unlogged"):
+        bits.append("在跑没挂号 " + "、".join(
+            f"{x['name']}({x.get('human') or '刚上线'})" for x in a["unlogged"][:4]))
+    if a.get("ghost"):
+        bits.append("任务主人已停 " + "、".join(
+            f"{x['name']}·{x['task'][:12]}" for x in a["ghost"][:3]))
+    if a.get("nosession"):
+        bits.append("有活没绑会话 " + "、".join(x["name"] for x in a["nosession"][:3]))
+    return ("⛔ 团队没对齐看板：" + "；".join(bits) +
+            "。开新计划/加人/导报告都会被拒绝。"
+            "→ 先 update_task(status='doing', assignee_id=<mid>)，再 member_duty(on=true)；"
+            "任务主人已经不在跑的，先收回 backlog 再重派人。")
+
+
 def _autopilot_line(st):
     """「你不出声的时候，这个项目会不会自己往前走」。这是根因，不是症状。"""
     a = st.get("autopilot") or {}
@@ -169,6 +191,7 @@ def summarize(p):
              # 放在排期/进度前面是故意的：这两个数字都能在自己埋头干的时候慢慢变好，
              # 只有 idles 不会。总监最容易漏掉的就是这一行。
              _idle_line(st),
+             _align_line(st),
              _board_line(st),
              _autopilot_line(st),
              f"目标：{p.get('goal') or '-'}" + (f"　截止：{p['deadline']}" if p.get("deadline") else ""),

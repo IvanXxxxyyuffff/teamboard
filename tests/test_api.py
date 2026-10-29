@@ -333,6 +333,66 @@ def main():
         bd = st2.get("board") or {}
         check("board tracks how long the plan has been untouched",
               bd.get("silent_sec", -9) >= 0 and "threshold_sec" in bd, bd)
+
+        # 全员对齐：人在跑、看板上却没有他的活 → 不是「进度慢」，是「账是空的」。
+        # 这一条和 idle 是两件事：idle 绿（有人在跑）时它才真正开始起作用。
+        _, p2 = call(base, "POST", "/api/projects",
+                     {"name": "align", "deadline": "2030-01-01 18:00",
+                      "goal": "g", "goal_criteria": "c"})
+        pid2 = p2["project"]["id"]
+        code, w = call(base, "POST", f"/api/projects/{pid2}/members",
+                       {"name": "工程甲", "role": "后端工程", "model": "gpt-test-large",
+                        "effort": "high", "model_confirmed": True})
+        check("alignment fixture: first seat lands", code in (200, 201) and w.get("id"), w)
+        code, sreq2 = call(base, "POST", f"/api/projects/{pid2}/staff-requests",
+                           {"kind": "add", "name": "验收乙", "role": "验收",
+                            "reason": "对齐测试要第二个工位"})
+        code, dec2 = call(base, "POST", f"/api/staff-requests/{sreq2['id']}/decide",
+                          {"decision": "approve"})
+        check("alignment fixture: second seat lands through approval",
+              code in (200, 201) and (dec2.get("member") or {}).get("id"), dec2)
+
+        # 一条 backlog：有活可派，但没人挂上去
+        code, t2 = call(base, "POST", f"/api/projects/{pid2}/tasks",
+                        {"title": "该挂上去的活", "assignee": w["id"], "estimate": 2,
+                         "milestone": "M1", "deliverable": str(doc), "dod": "x"})
+        sfile = day / "rollout-2026-01-02T00-00-00-01a2b3c4-9999-7222-8333-444455556666.jsonl"
+        sfile.write_text(
+            json.dumps({"type": "session_meta", "payload": {"id": "01a2b3c4-9999-7222-8333-444455556666"}}) + "\n"
+            + json.dumps({"type": "response_item",
+                          "payload": {"type": "function_call_output"}}) + "\n",
+            encoding="utf-8")
+        call(base, "POST", f"/api/projects/{pid2}/members/{w['id']}/bind",
+             {"thread_id": "01a2b3c4-9999-7222-8333-444455556666"})
+        # 把「最后一次碰看板」推到 20 分钟前：宽限期过了才算违规
+        import sqlite3
+        from datetime import datetime, timedelta, timezone
+        con = sqlite3.connect(str(home / "board.db"))
+        old_iso = (datetime.now(timezone.utc).astimezone() - timedelta(minutes=20)
+                   ).isoformat(timespec="seconds")
+        con.execute("UPDATE tasks SET updated_at=? WHERE id=?", (old_iso, t2["id"]))
+        # 绑会话也是 20 分钟前的事：宽限期算的是「最后一次碰看板」，不是「刚绑上」
+        con.execute("UPDATE members SET bound_at=? WHERE id=?",
+                    (time.time() - 1200, w["id"]))
+        con.commit()
+        con.close()
+        time.sleep(2.2)          # 会话索引 2 秒缓存
+        code, st3 = call(base, "GET", f"/api/projects/{pid2}")
+        al = st3.get("align") or {}
+        check("a member working off-board is flagged as unlogged",
+              al.get("ok") is False
+              and any(x["name"] == "工程甲" for x in (al.get("unlogged") or [])), al)
+        code, denied2 = call(base, "POST", f"/api/projects/{pid2}/approvals",
+                             {"goal": "g", "goal_criteria": "c", "priority_ratio": "1:1:0",
+                              "members": [], "tasks": []})
+        check("a new plan is refused while the team is off-board",
+              code in (400, 403) and denied2.get("need_align"), denied2)
+        # 解闸：把活挂到人头上（这正是被要求的那一个动作）
+        call(base, "PATCH", f"/api/tasks/{t2['id']}", {"status": "doing", "assignee_id": w["id"]})
+        code, st4 = call(base, "GET", f"/api/projects/{pid2}")
+        check("registering the task clears the alignment gate",
+              (st4.get("align") or {}).get("ok") is True,
+              {k: st4.get("align", {}).get(k) for k in ("unlogged", "ghost", "nosession")})
     finally:
         kill_board(base)
         try:

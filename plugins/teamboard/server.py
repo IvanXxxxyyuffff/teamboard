@@ -815,6 +815,10 @@ def create_approval(pid, b):
     gate = idle_gate(pid)
     if gate:
         return gate
+    # 有人在跑却不在看板上？先挂号再谈新计划——不然这份计划从第一秒就是空气。
+    gate = align_gate(pid)
+    if gate:
+        return gate
     tasks = b.get("tasks") or []
     members = b.get("members") or []
     problems = validate_plan(pid, b)
@@ -1371,6 +1375,15 @@ SESSION_INDEX_DAYS = 10
 # 长于 15 分钟则意味着一整段排期被浪费掉了。
 # 触发后写操作全部 403，只有「派人干活」类动作放行——逼他先解决人。
 IDLE_ALERT_SEC = 900
+# 对齐闸的两条时间线。
+#   ALIGN_GRACE_SEC：会话在跑、但看板上没有它的在办任务，持续多久才算「干活不挂号」。
+#     10 分钟是刻意放长的：spawn 之后到第一次 update_task 之间必然有空档，
+#     收工→领下一个任务之间也是。把这段算成违规只会把闸门变成噪音，
+#     而噪音闸的结局是被 force 绕过，等于没有。
+#   ALIGN_GHOST_GRACE_SEC：任务还挂着 doing、主人已经不在跑，多久才算僵尸任务。
+#     要短：这正是用户反复报的那个 bug（子代理停了，看板还在替它干活）。
+ALIGN_GRACE_SEC = 600
+ALIGN_GHOST_GRACE_SEC = 120
 _AGENT_CACHE = {}
 # 事件流里的「这一轮结束了」。Codex 退出时补的是 turn_aborted，
 # 正常收工补的是 task_complete——两种都不是「还在干活」。
@@ -1822,6 +1835,8 @@ def automation_status(lead_thread):
                 "已经停掉的会直接从列表里消失——看上去一片正常，其实一个人都没在干活。\n"
                 "- idle.alert=true → 全员停摆：先给每个空工位派活（update_task 认领 "
                 "+ member_duty），一个都不许留空；\n"
+                "- align.ok=false → 有人没对齐看板（在跑没挂号 / 任务主人已停 / 有活没绑会话）："
+                "先按 align 的三张清单逐条修，修完再谈进度；\n"
                 "- 有成员 state≠working 却挂着 doing 任务 → 先回收或重开（spawn → bind_member），"
                 "别当它还在跑；\n"
                 "- 再干自己那条线。不看团队就直接干活的这一轮，视为无效轮。\n")}
@@ -1861,6 +1876,44 @@ def idle_gate(pid):
             ]}
 
 
+def align_gate(pid):
+    """全员对齐闸：看板与实际执行体对不上 → 拦住「开新计划 / 加人 / 交报告」。
+
+    idle_gate 回答的是「有没有人在干活」，这个闸回答的是「干活的人挂的是哪一条」。
+    两者都会漏：4 个人都在跑、但跑的东西看板上一片空白时，idle 是绿的，
+    而用户看到的进度、工时、卡点全是空气——这正是「总监不关注队员在干什么」的
+    制度化表现，光靠提醒改不过来，只能让他的下一步动作失败。
+
+    放行的是解闸动作本身（update_task / member_duty / bind_member / heartbeat），
+    与 idle_gate 同一套放行表，避免死锁。
+    """
+    st = project_state(pid)
+    if not st:
+        return None
+    a = st.get("align") or {}
+    if a.get("ok", True):
+        return None
+    parts = []
+    if a.get("unlogged"):
+        parts.append("在跑但没挂号：" + "、".join(
+            f"{x['name']}({x['human']})" for x in a["unlogged"][:4]))
+    if a.get("ghost"):
+        parts.append("任务挂着人没了：" + "、".join(
+            f"{x['name']}·{x['task'][:14]}({x['human']})" for x in a["ghost"][:4]))
+    if a.get("nosession"):
+        parts.append("有活没绑会话：" + "、".join(
+            f"{x['name']}·{x['task'][:14]}" for x in a["nosession"][:4]))
+    return {"error": "团队没对齐看板：" + "；".join(parts) +
+                     "。先把人挂到看板上，再谈新计划。",
+            "need_align": True, "align": a,
+            "next_actions": [
+                "POST /api/members/<mid>/duty  {on:true, minutes:45}  → 登记在场",
+                "POST /api/tasks/<tid>  {status:'doing', assignee_id:<mid>}  → 把活挂到他名下",
+                "POST /api/projects/<pid>/members/<mid>/bind  {thread_id:'<全 UUID>'}  → 补绑会话",
+                "任务主人已经不在跑 → 先 update_task 收回（backlog），再 spawn 重开 + bind",
+            ]}
+
+
 def autopilot_prompt(pid, name):
     """自驱心跳的 prompt。写成模板，不写死某个项目——开源后别人拉起团队也能直接用。"""
     return (
@@ -1870,6 +1923,9 @@ def autopilot_prompt(pid, name):
         "1) 看团队（第一件事，不可跳过）：调用 teamboard 的 project_status，读 idle 字段。\n"
         "   - idle.alert = true（全员停摆）→ 立刻派活：把 backlog 里优先级最高的任务 "
         "update_task 认领 + member_duty 分工给每个人；一个工位都不许空着。\n"
+        "   - align.ok = false（团队没对齐看板）→ 按 align.unlogged / align.ghost / "
+        "align.nosession 三张清单逐条修：在跑的人必须有在办任务，在办任务的主人必须真在跑，"
+        "有活的人必须绑了会话。修完再谈别的。\n"
         "   - 成员 state ≠ working 却挂着 doing 任务 → 先回收（改回 backlog 或换人）"
         "或重开子代理（spawn → bind_member）。不要假设它还活着。\n"
         "   - 静默超过 15 分钟 = 掉线，按掉线处理。\n"
@@ -2701,6 +2757,68 @@ def project_state(pid):
     # 这里只留三个数，避免每次轮询都重算一份大对象。
     orphans = [t for t in tasks if t["status"] == "doing"
                and next((x for x in members if x["id"] == t["assignee_id"]), {}).get("state") != "working"]
+    # ---------------------------------------------------------------- 全员对齐
+    # 用户的原话：「总监以及他下面的所有队员必须强制对齐 Teamboard」。
+    # 「对齐」在这里只有一种可核对的含义：**谁在跑，跑的是看板上的哪一条**。
+    # 三种对不上，每种只有一个正确解法：
+    #   unlogged  = 会话在跑，但看板上没有它的在办任务 → update_task(doing) + member_duty
+    #   nosession = 有在办任务，但工位没绑会话线程     → bind_member
+    #   ghost     = 在办任务的主人已经不在跑          → 回收任务，或 spawn 重开再 bind
+    # 总监不参与 unlogged：它的「活」就是这条会话本身，把它算成没挂号会永久红灯。
+    # 总监的脱轨由 board.derail 单独报，但那一条**不进闸**——脱轨时它唯一该做的事
+    # 就是重排计划（create_approval），把出口堵上等于把车锁死在沟里。
+    _last_touch = {}
+    for t in tasks:
+        aid = t.get("assignee_id") or ""
+        if not aid:
+            continue
+        ts = _epoch(t.get("updated_at") or t.get("created_at"))
+        if ts > _last_touch.get(aid, 0):
+            _last_touch[aid] = ts
+    align_unlogged, align_nosession, align_ghost = [], [], []
+    # 「在看板上」= 手上有一条正在推进的活。doing / blocked / review 都算：
+    # 卡住的人也在为这条任务干活（正在查卡点），提交待验收的人也可能在补证据。
+    # 只有一条都不占、会话却还在写的人，才是真的「干活不挂号」。
+    REGISTERED = ("doing", "blocked", "review")
+    for m in members:
+        if m.get("is_lead"):
+            continue
+        active_mine = [t for t in tasks
+                       if t.get("assignee_id") == m["id"] and t["status"] in REGISTERED]
+        doing_mine = [t for t in tasks
+                      if t.get("assignee_id") == m["id"] and t["status"] == "doing"]
+        if active_mine and not m["thread_id"]:
+            align_nosession.append({"id": m["id"], "name": m["name"],
+                                    "seat": m.get("seat_label") or "",
+                                    "task": active_mine[0]["title"],
+                                    "task_id": active_mine[0]["id"]})
+        if doing_mine and m["state"] not in ("working", "blocked"):
+            t0 = doing_mine[0]
+            hung = max(0, int(now - _epoch(t0.get("updated_at") or t0.get("created_at"))))
+            if hung >= ALIGN_GHOST_GRACE_SEC:
+                align_ghost.append({"id": m["id"], "name": m["name"],
+                                    "seat": m.get("seat_label") or "",
+                                    "state": m["state"], "hung_sec": hung,
+                                    "human": _hm(hung),
+                                    "task": t0["title"], "task_id": t0["id"]})
+        if m["session_live"] and not active_mine and open_n:
+            last = max(_last_touch.get(m["id"], 0), float(m.get("bound_at") or 0))
+            gap = int(now - last) if last > 0 else -1
+            if gap < 0 or gap >= ALIGN_GRACE_SEC:
+                align_unlogged.append({"id": m["id"], "name": m["name"],
+                                       "seat": m.get("seat_label") or "",
+                                       "agent": m.get("agent_leaf") or "",
+                                       "silent": int(m.get("session_silent") if
+                                                     m.get("session_silent") is not None else -1),
+                                       "unlogged_sec": gap,
+                                       "human": _hm(gap) if gap > 0 else "刚上线"})
+    align = {"ok": not (align_unlogged or align_nosession or align_ghost),
+             "checked": len(workers),
+             "unlogged": align_unlogged, "nosession": align_nosession,
+             "ghost": align_ghost,
+             "grace_sec": ALIGN_GRACE_SEC, "ghost_grace_sec": ALIGN_GHOST_GRACE_SEC,
+             # 脱轨只报不拦：它不能进 ok，否则总监想重排计划时会被自己的闸挡住
+             "derail": derail}
     last_any = max([float(m.get("last_alive") or 0) for m in members] or [0])
     return {"project": dict(p), "members": members, "tasks": tasks, "stats": stats,
             "resume": {"orphans": len(orphans),
@@ -2736,6 +2854,8 @@ def project_state(pid):
                            "load": int(m.get("load") or 0)}
                           for m in workers],
                          key=lambda x: (x["silent"] < 0, -(x["silent"] or 0)))},
+            # 全员对齐：谁在跑、跑的是哪一条。对不上就拦「开新计划/加人/交报告」
+            "align": align,
             # 自驱器：决定「用户不说话时项目会不会继续跑」
             "autopilot": auto,
             # 脱轨：总监多久没碰计划。员工在干活也可能脱轨——那时候看板上的
@@ -3124,6 +3244,10 @@ def add_member(pid, b):
     gate = idle_gate(pid)
     if gate:
         return gate
+    # 扩编同理：人已经在跑但没挂号，再加一个只会多一份对不上的账。
+    gate = align_gate(pid)
+    if gate:
+        return gate
     err = check_model(b.get("model", "")) or check_effort(b.get("model", ""), b.get("effort", ""))
     if err:
         return {"error": err, "field": "effort"}
@@ -3505,15 +3629,29 @@ def project_health(pid, st=None):
             "silent_sec": silent_min,
             "stale": stale, "vacant": vacant, "unseated": unseated,
             "orphan_tasks": orphan_tasks,
+            # 对齐：三个数分开给，前端不用自己再拆
+            "align": (st.get("align") or {}),
             "counts": {"members": len(st["members"]), "stale": len(stale),
                        "vacant": len(vacant), "unseated": len(unseated),
-                       "orphan_tasks": len(orphan_tasks)},
+                       "orphan_tasks": len(orphan_tasks),
+                       "unlogged": len((st.get("align") or {}).get("unlogged") or []),
+                       "nosession": len((st.get("align") or {}).get("nosession") or []),
+                       "ghost": len((st.get("align") or {}).get("ghost") or [])},
             "summary": " · ".join(filter(None, [
                 # 停摆必须排在最前面：它是唯一一条「整队都没在动」的结论，
                 # 其余几项都只是局部异常。
                 (f"全员停摆 {(st.get('idle') or {}).get('human', '')}"
                  if (st.get("idle") or {}).get("alert") else
                  ("0 人在干活" if (st.get("idle") or {}).get("warn") else "")),
+                # 对齐排在停摆之后、其余之前：它解释「为什么看板是空的」。
+                (("团队没对齐：" + "·".join(filter(None, [
+                    (f"{len((st.get('align') or {}).get('unlogged') or [])} 人在跑没挂号"
+                     if (st.get("align") or {}).get("unlogged") else ""),
+                    (f"{len((st.get('align') or {}).get('ghost') or [])} 条任务人已不在跑"
+                     if (st.get("align") or {}).get("ghost") else ""),
+                    (f"{len((st.get('align') or {}).get('nosession') or [])} 条任务没绑会话"
+                     if (st.get("align") or {}).get("nosession") else "")])))
+                 if not (st.get("align") or {}).get("ok", True) else ""),
                 ("没有自驱心跳，用户不出声项目就停"
                  if not (st.get("autopilot") or {}).get("ready") else ""),
                 (f"总监 {st['board']['human']}没碰计划"
@@ -3620,6 +3758,24 @@ def resume_brief(pid):
                    f"派不了活、记不了时，等于白跑。先 bind_member。 | " + verdict)
         actions.insert(0, "先给在跑的会话落座：bind_member(member=\"<工位名>\", "
                           "thread_id=\"<全 UUID>\")，再 member_duty(on=true, minutes=45)")
+    # 对齐：开工第一件事，把「谁在跑 / 跑的是哪条」对一遍。对不上就不要往下走，
+    # 否则后面所有数字都建立在一张空账上。
+    align = st.get("align") or {}
+    if not align.get("ok", True):
+        bits = []
+        if align.get("unlogged"):
+            bits.append("在跑没挂号 " + "、".join(
+                f"{x['name']}({x['human']})" for x in align["unlogged"][:4]))
+        if align.get("ghost"):
+            bits.append("任务主人已停 " + "、".join(
+                f"{x['name']}·{x['task'][:12]}" for x in align["ghost"][:3]))
+        if align.get("nosession"):
+            bits.append("有活没绑会话 " + "、".join(
+                x["name"] for x in align["nosession"][:3]))
+        verdict = (f"⛔ 团队没对齐看板：{'；'.join(bits)}。 | " + verdict)
+        actions.insert(0, "先对齐：每个在跑的人 update_task(status=doing, assignee_id=<mid>) "
+                          "挂到看板上，再 member_duty(on=true) 登记在场；"
+                          "任务主人已经不在跑的，先收回 backlog 再重新派人")
     # 作废清单：接手的人最容易犯的错是把已经排除的路再走一遍。
     # 这条比任何进度数字都省时间，所以放在简报里，不藏在任务详情里。
     invalidated = [{"id": t["id"], "title": t["title"],
@@ -3636,6 +3792,7 @@ def resume_brief(pid):
                            if last_any > 0 else ""),
         "working": len(up), "not_working": len(dead), "total": len(team),
         "needs_reconcile": bool(orphans),
+        "align": align,
         "verdict": verdict,
         "orphans": orphans,
         "unseated": unseated,
@@ -4210,6 +4367,11 @@ class Handler(BaseHTTPRequestHandler):
             # 交不了的报告不该交：全员停摆时导出的「进度」是假的，
             # 用户看到的是百分比，看不到下面一个人都没在跑。
             gate = idle_gate(m.group(1))
+            if gate:
+                gate["error"] = "导出被拦：" + gate["error"]
+                return self._send(403, gate)
+            # 看板和实际执行体对不上时，导出的进度表就是在给用户看假账。
+            gate = align_gate(m.group(1))
             if gate:
                 gate["error"] = "导出被拦：" + gate["error"]
                 return self._send(403, gate)

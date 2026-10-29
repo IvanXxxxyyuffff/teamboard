@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.11 — everyone has to be on the board
+
+`idle` answers "is anyone working". It cannot answer **"which task is that person working on"**.
+Four sessions can be busy while the board is blank: the idle signal stays green and every
+number on the page — progress, hours, blockers — is fiction. That is the institutional version
+of "the director never checks what the team is doing".
+
+`project_state.align` now exposes three lists:
+
+| list | meaning | only correct fix |
+|---|---|---|
+| `unlogged` | session is running, no `doing/blocked/review` task under its name (≥10 min) | `update_task(status="doing", assignee_id=...)` + `member_duty(on=true)` |
+| `ghost` | task sits in `doing` while its owner stopped running (≥2 min) | reclaim to `backlog`, or respawn + `bind_member` |
+| `nosession` | member holds work but its seat has no session thread | `bind_member(thread_id="<full UUID>")` |
+
+`ok=false` blocks `propose_plan` / `add_member` / report export with 403 `need_align` plus
+`next_actions`. The unlocking actions (`update_task`, `member_duty`, `bind_member`,
+`heartbeat`) are never gated — closing the exit turns a gate into a deadlock.
+
+The grace windows are deliberate: 10 minutes for `unlogged` (the gap between spawn and the
+first `update_task` always exists, and a noisy gate gets bypassed with `force`, which is the
+same as no gate), 2 minutes for `ghost` (a stopped agent whose task still reads `doing` is
+exactly the bug users keep reporting).
+
+`align.derail` is reported, never gated: a derailed director's one correct move is to replan,
+and blocking that locks the car in the ditch.
+
+Surfaced in `health.summary`, the first line of `project_status`, `resume_brief.verdict`,
+both UI banners, and the autopilot heartbeat prompt.
+
 ## 0.3.10 — the plan is a constraint, not a wall chart
 
 Two holes let a director skip the plan while looking productive.

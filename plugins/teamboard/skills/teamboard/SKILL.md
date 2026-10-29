@@ -81,6 +81,31 @@ description: 当用户问「我的团队现在在做什么 / 项目进度怎么�
 拉起团队时必须同时把心跳建好：`propose_plan` 会在 `warnings` 里点名。批了计划却没心跳，
 等于签了一份不会执行的合同。
 
+### 全员对齐（`align`）
+
+`idle` 管「有没有人在干活」，`align` 管**「干活的人挂的是哪一条」**。
+有人跑着、看板上却没有他的在办任务时，`idle` 是绿的，而进度/工时/卡点全是空气。
+
+```json
+"align": {"ok": false, "checked": 4,
+          "unlogged":  [{"name":"battle_srv","human":"54分钟"}],
+          "ghost":     [{"name":"quest3_detector","task":"2001 客栈判定圈","human":"15分钟"}],
+          "nosession": [{"name":"battle_e2e","task":"event_6820 剧本战斗"}]}
+```
+
+| 清单 | 含义 | 唯一解法 |
+|---|---|---|
+| `unlogged` | 会话在跑，名下却没有 `doing/blocked/review` 任务（≥10 分钟） | `update_task(status="doing", assignee_id=<mid>)` + `member_duty(on=true)` |
+| `ghost` | 任务挂着 `doing`，主人已不在跑（≥2 分钟） | 收回 `backlog`，或重开子代理 + `bind_member` |
+| `nosession` | 名下有活，工位没绑会话线程 | `bind_member(thread_id="<全 UUID>")` |
+
+`ok=false` → `propose_plan` / `add_member` / 导出报告 403 `need_align`；
+解闸动作（`update_task` / `member_duty` / `bind_member` / `heartbeat`）永远放行。
+`align.derail` 只报不拦——脱轨时要允许总监重排计划。
+
+三条纪律：**开工先挂号**（第一个动作是 `update_task(doing)`，不是先看代码）、
+**收工就摘牌**（`done` + `member_duty(on=false)`）、**换会话不算换人**（`bind_member` 不走审批）。
+
 ## 拉起团队的硬流程（缺一项，服务端直接拒绝）
 
 用户说「拉起一个团队做 X」时按顺序走，不许跳步。
@@ -237,7 +262,7 @@ spawn 时 `on:true`，收工 `on:false`。它决定面板显示「工作中」�
 
 可选：`priority`、`estimate`（加权进度用）、`resource`、`evidence`。
 
-## 四个硬闸
+## 五个硬闸
 
 1. **交付物存在性**：`deliverable` 支持 `a|b`、`a + b`、`{X,Y}.md`、通配符；
    相对路径按 `project.workdir` 解析。一个文件都不存在时，`status=done` 会被拒绝（400）。
@@ -247,6 +272,8 @@ spawn 时 `on:true`，收工 `on:false`。它决定面板显示「工作中」�
 4. **全员停摆**：员工 0 个在干活、且还有未收工任务，累计 ≥15 分钟 → `propose_plan` /
    `add_member` / 导出报告 一律 403（`need_idle_fix`）。解闸动作照常放行：
    `update_task` / `heartbeat` / `bind_member` / `member_duty`。
+5. **全员对齐**：有人在跑却没挂号、任务主人已停、有活没绑会话 → 同样 403（`need_align`），
+   返回三张清单 + `next_actions`；三项都空才算对齐（`align.ok=true`）。
 
 ## 进度与停滞
 
