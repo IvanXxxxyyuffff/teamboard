@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.6 — done means "I can show you how I checked"
+
+Three gaps that a board with 23 tasks and 9 hours left actually hit:
+
+**A finished task must carry a command.** `update_task(status=done)` now requires
+`verify_cmd` — one command anyone can re-run to see pass/fail — plus an optional
+`verify_out` (max 5 lines) and an automatic `verified_at` stamp. An `evidence_path` only
+proves a file exists; it does not prove anyone ran it. Tasks finished with `force=true`
+are counted as `done_without_evidence` and marked ⚠ on the card, so "13 of 13 finished,
+none reproducible" is visible instead of implied.
+
+**Critical path remaining, in hours.** `critical_hours` is the tail task's ETA minus now —
+*not* the sum of every `eta_left` on the chain, which double-counts overlapping work and
+inflates the answer (A 0–2h plus B 2–5h is 5h, not 7h). `critical_gap = critical_hours −
+hours_left`; a positive number means scope has to go, not that the team needs to hurry.
+Shown in the countdown block and as a KPI chip.
+
+**Lease renewal and overdue visibility.** Claiming the same task again renews (`renewed:
+true`) — a long job must be able to extend, otherwise the TTL expires and another seat can
+legitimately take the device while both believe they hold it. An expired lease that nobody
+released now reports `overdue_min` and renders red.
+
+`resume_brief` also lists every `abandoned` task with its reason, so whoever takes over sees
+which paths are already ruled out before re-walking them.
+
 ## 0.3.5 — a written file is not a running agent
 
 The previous fix closed the exit path (`turn_aborted` / `task_complete`) but left the entry

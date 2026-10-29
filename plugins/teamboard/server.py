@@ -157,7 +157,8 @@ def cn_role(role):
 TASK_FIELDS = ("title", "detail", "role", "assignee_id", "status", "priority",
                "sort_order", "deliverable", "dod", "depends_on", "estimate",
                "progress", "blocked_reason", "milestone", "resource", "evidence",
-               "due_at", "evidence_path", "abandoned_reason")
+               "due_at", "evidence_path", "abandoned_reason",
+               "verify_cmd", "verify_out", "verified_at")
 EVIDENCE = ("observed", "inferred", "assumed")
 
 
@@ -280,6 +281,11 @@ def init_db():
             ("tasks", "paused_at", "REAL DEFAULT 0"),     # 等设备/等审批：暂停时段不计入工时
             ("tasks", "paused_sec", "REAL DEFAULT 0"),
             ("tasks", "evidence_path", "TEXT DEFAULT ''"),   # 证据落在哪个文件/目录
+            # 完成证据三件套：产物路径 + 一条能重跑的命令 + 当时的输出。
+            # 光有 evidence_path 只能证明「文件存在」，证明不了「跑过、通过」。
+            ("tasks", "verify_cmd", "TEXT DEFAULT ''"),      # 任何人能复制粘贴重跑的那一条命令
+            ("tasks", "verify_out", "TEXT DEFAULT ''"),      # 实测输出（≤5 行），没有就是空
+            ("tasks", "verified_at", "TEXT DEFAULT ''"),     # 这条证据是什么时候跑的
             ("tasks", "abandoned_reason", "TEXT DEFAULT ''"),# 放弃原因，换人接手时最值钱
             ("members", "is_lead", "INTEGER DEFAULT 0"),  # 总监不计入员工编制
             ("projects", "goal_criteria", "TEXT DEFAULT ''"),
@@ -1051,15 +1057,18 @@ def claim_resource(pid, name, b):
                                    "title": holder["title"] if holder else "",
                                    "until": cur["until"], "left_sec": int(float(cur["until"])-now)}}
         until = now + minutes * 60
+        # 同一个 task 再 claim 一次 = 续期（长任务必须能续，否则 60 分钟后
+        # 别人合法抢走设备，两边都以为自己是唯一持有者）
+        renewed = bool(cur and cur["holder_task"] == task_id)
         c.execute("INSERT INTO resource_leases(project_id,resource,holder_task,holder_member,until,note,created_at)"
                   " VALUES(?,?,?,?,?,?,?) ON CONFLICT(project_id,resource) DO UPDATE SET"
                   " holder_task=excluded.holder_task, holder_member=excluded.holder_member,"
                   " until=excluded.until, note=excluded.note, created_at=excluded.created_at",
                   (pid, name, task_id, member, until, b.get("note", ""), now_iso()))
         log_event(c, pid, "resource.claim", actor=member or task_id,
-                  task_id=task_id, payload=f"{name} {minutes}m")
+                  task_id=task_id, payload=f"{name} {minutes}m" + (" (renew)" if renewed else ""))
     return {"ok": True, "resource": name, "holder_task": task_id,
-            "until": until, "left_sec": minutes * 60}
+            "until": until, "left_sec": minutes * 60, "renewed": renewed}
 
 
 def release_resource(pid, name, b):
@@ -2128,9 +2137,14 @@ def project_state(pid):
         l["holder_title"] = tmap.get(l["holder_task"], {}).get("title", "")
         l["left_sec"] = int(float(l["until"] or 0) - now)
         l["expired"] = l["left_sec"] <= 0
+        # 过期 ≠ 已释放：TTL 到了但没人 release，adb 可能还连着那台设备。
+        # 「过期自动可抢」只解决了抢不到的问题，没解决「两个人以为自己是唯一持有者」。
+        l["overdue_min"] = max(0, int(-l["left_sec"] / 60)) if l["expired"] else 0
         l["queue"] = [t["title"] for t in tasks
                       if (t.get("resource") or "").strip() == l["resource"]
                       and t["status"] in ("backlog", "blocked") and t["id"] != l["holder_task"]]
+    # 超时仍占着设备的租约：顶部要单独喊，不能让总监自己翻租约表
+    lease_overdue = [l for l in leases if l["expired"] and l["holder_task"]]
     refuted = {}
     for h in hyps:
         if h["verdict"] == "refuted":
@@ -2203,6 +2217,19 @@ def project_state(pid):
     except Exception:                                     # noqa: BLE001
         unseated = []                                     # 扫不到就不报，宁缺勿假
     prio_counts = {k: len([t for t in open_tasks if t["prio"] == k]) for k in (1, 2, 3)}
+    # 关键路径剩余 = 链尾那条任务预计几点交 − 现在。
+    # 不能把链上各任务的 eta_left 相加：它们已经各自从 now 起算，
+    # A 0–2h、B 2–5h 相加得 7h，实际收工只要 5h——那样会把「差多少」直接虚报一半。
+    # 「谁在忙」和「离通还差多少」是两个问题：前者看成员行，后者只看这一个数。
+    crit_open = [t for t in tasks if t.get("on_critical") and t["status"] != "done"
+                 and t["status"] != "abandoned"]
+    crit_finish = max((float(t.get("eta_at") or 0) for t in crit_open), default=0.0)
+    critical_hours = round(max(0.0, crit_finish - now) / 3600.0, 1) if crit_open else 0.0
+    critical_gap = (round(critical_hours - hours_left, 1) if hours_left is not None else None)
+    # 无证据的 done：只统计，不回溯改状态。历史任务多半没留证据，
+    # 直接把 13 条翻回未完成会让进度条撒谎；暴露数字比伪造闸门有用。
+    done_without_evidence = [t for t in tasks if t["status"] == "done"
+                             and not (t.get("verify_cmd") or "").strip()]
     # 断线摘要：面板顶部横幅用。全量明细走 /resume-brief，
     # 这里只留三个数，避免每次轮询都重算一份大对象。
     orphans = [t for t in tasks if t["status"] == "doing"
@@ -2231,6 +2258,9 @@ def project_state(pid):
                 "swapped": len([m for m in members if m["bind_count"] > 1]),
             },
             "leases": leases, "hypotheses": hyps[:80], "criteria": crits,
+            "lease_overdue": [{"resource": l["resource"], "task": l["holder_title"],
+                               "member": l.get("holder_member", ""),
+                               "overdue_min": l["overdue_min"]} for l in lease_overdue],
             "criteria_green": len([x for x in crits if x["status"] == "green"]),
             # unknown（还没跑过判定）不进分母：否则「一条都没验」会被读成「全不达标」
             "criteria_total": len([x for x in crits if x["status"] in ("green", "red")]),
@@ -2260,6 +2290,12 @@ def project_state(pid):
             "eta_finish": eta_finish,
             "eta_slip_hours": eta_slip_hours,
             "critical_chain": crit_titles,
+            # 「离通还差多少」：关键路径上还剩几小时 vs 还剩多少时间
+            "critical_hours": critical_hours,
+            "critical_gap": critical_gap,
+            "critical_open": len(crit_open),
+            "done_without_evidence": len(done_without_evidence),
+            "done_total": len([t for t in tasks if t["status"] == "done"]),
             "over_top": over_top,
             "estimate_bias": estimate_bias,
             "estimate_done_est": round(d_est, 1), "estimate_done_act": round(d_act, 1),
@@ -2775,6 +2811,20 @@ def update_task(tid, b):
             if not any_ok:
                 return {"error": "evidence_path 不存在：" + "、".join(miss),
                         "field": "evidence_path", "missing": miss, "need_evidence": True}
+            # 「修好了」不值钱，「任何人能重跑的那条命令」才值钱。
+            # 只给文件路径 = 证明文件存在，证明不了跑过、通过。
+            vc = (b.get("verify_cmd") or t["verify_cmd"] or "").strip()
+            if not vc:
+                return {"error": "标完成必须带 verify_cmd：一条能复制粘贴重跑、"
+                                 "一眼看出通过/失败的命令（例：python3 tests/x.py --case 3）",
+                        "field": "verify_cmd", "need_evidence": True,
+                        "hint": "纯人工判断确实没有命令的，带 force=true；看板会把它算进「无证据完成」"}
+            b.setdefault("verify_cmd", vc)
+            b.setdefault("verified_at", now_iso())
+            vo = (b.get("verify_out") or "").strip()
+            if vo:
+                # 输出只留 5 行：日志全文去 evidence_path 里找，卡片上要的是结论
+                b["verify_out"] = "\n".join(vo.splitlines()[:5])[:600]
         # 交付物必须真实存在，才允许标记完成
         if st == "done":
             dl = (b.get("deliverable") or t["deliverable"] or "").strip()
@@ -2972,6 +3022,14 @@ def resume_brief(pid):
                    f"派不了活、记不了时，等于白跑。先 bind_member。 | " + verdict)
         actions.insert(0, "先给在跑的会话落座：bind_member(member=\"<工位名>\", "
                           "thread_id=\"<全 UUID>\")，再 member_duty(on=true, minutes=45)")
+    # 作废清单：接手的人最容易犯的错是把已经排除的路再走一遍。
+    # 这条比任何进度数字都省时间，所以放在简报里，不藏在任务详情里。
+    invalidated = [{"id": t["id"], "title": t["title"],
+                    "reason": (t.get("abandoned_reason") or "").strip(),
+                    "when": t.get("updated_at", "")}
+                   for t in tasks if t["status"] == "abandoned"]
+    if invalidated:
+        actions.append(f"先读「已作废 {len(invalidated)} 条」：这些路已经排除了，别再走一遍")
 
     return {
         "project_id": pid, "name": st["project"].get("name", ""), "generated_at": now_iso(),
@@ -2983,6 +3041,7 @@ def resume_brief(pid):
         "verdict": verdict,
         "orphans": orphans,
         "unseated": unseated,
+        "invalidated": invalidated,
         "team": team,
         "actions": actions,
         "note": "这是事实快照，不是建议：先处置 orphans，再派新活。",

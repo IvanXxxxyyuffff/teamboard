@@ -11,7 +11,7 @@ try:
         VERSION = _f.read().strip() or "2.1.0"
 except OSError:
     VERSION = "2.1.0"
-UI_URI = "ui://teamboard/panel14"   # v4: 面板改为经 MCP 代理取数（沙箱 CSP 禁 connect-src http）
+UI_URI = "ui://teamboard/panel15"   # v4: 面板改为经 MCP 代理取数（沙箱 CSP 禁 connect-src http）
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_FILE = os.path.join(HERE, "ui", "panel.html")
 UI_MIME = "text/html;profile=mcp-app"
@@ -128,6 +128,20 @@ def summarize(p):
                  f"剩 {st['hours_left']}h" if st.get("hours_left") is not None else "",
                  f"剩余工时 {st['remaining_hours']}h" if st.get("remaining_hours") is not None else "",
                  "已超支" if st.get("over_budget") else ""])) or "未设截止"),
+             # 「谁在忙」和「离通还差多少」是两个问题，顶部必须给后者的数字
+             ("关键路径：" + (
+                 f"还需 {st['critical_hours']}h"
+                 + (f"，比剩余时间多 {st['critical_gap']}h → 不砍 scope 就交不了"
+                    if (st.get("critical_gap") or 0) > 0 else
+                    f"，比剩余时间少 {abs(st['critical_gap'])}h")
+                 if st.get("critical_hours") is not None else "—"))
+              if st.get("hours_left") is not None else "",
+             # 口头说「修好了」不算数，看这个数字
+             (f"证据：完成 {st.get('done_total', 0)} 条里有 {st.get('done_without_evidence', 0)} 条"
+              f"没有可重跑的命令（⚠ 无证据）"
+              if st.get("done_without_evidence") else
+              (f"证据：{st.get('done_total', 0)} 条完成全部带 verify_cmd ✅"
+               if st.get("done_total") else "")),
              f"任务 {s['total']}｜完成 {s['done']}｜进行中 {s['doing']}｜待验收 {s['review']}｜阻塞 {s['blocked']}", "",
              "## 成员"]
     rs = st.get("resume") or {}
@@ -272,9 +286,15 @@ TOOLS = [
          "estimate": {"type": "number", "description": "工作量（人时）。排期和倒计时都靠它：estimate 就是这条任务的时间预算"},
          "paused": {"type": "boolean", "description": "true=暂停计时（等设备/等审批），false=恢复；暂停期间墙钟不算工时"},
          "evidence_path": {"type": "string", "description": "证据文件/目录，置 done 必填且必须真实存在"},
+         "verify_cmd": {"type": "string",
+                        "description": "置 done 必填：一条任何人能复制粘贴重跑、一眼看出通过/失败的命令。"
+                                       "只给文件路径只能证明「文件存在」，证明不了「跑过、通过」"},
+         "verify_out": {"type": "string",
+                        "description": "这条命令的实测输出（只留结论，最多 5 行）。没有就不传——不要编"},
          "abandoned_reason": {"type": "string", "description": "放弃原因，status=abandoned 时必填"},
          "due_at": {"type": "number", "description": "硬截止（epoch 秒）。一般不用填，排期会自动算预计交付"}}, "required": ["task"]}},
-    {"name": "claim_resource", "description": "给设备/独占资源上租约（例如 emulator-5556）。被占用返回 400+holder，过期自动可抢",
+    {"name": "claim_resource", "description": "给设备/独占资源上租约（例如 emulator-5556）。"
+     "被占用返回 400+holder，过期自动可抢；同一个 task 再 claim 一次＝续期（长任务必须续，否则 TTL 到点别人会合法抢走）",
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "string"},
          "resource": {"type": "string", "description": "资源名，如 emulator-5556"},
@@ -466,6 +486,11 @@ def call(name, args):
             lines += ["", f"## 烂尾任务 {len(r['orphans'])} 条（doing 但人不在）"]
             for o in r["orphans"]:
                 lines.append(f"- {o['task_id']} {o['title']} — {o['assignee']} · {o['why']} · {o['idle_human']}没动")
+        # 作废清单放在处置清单之前：接手的人最容易犯的错是把排除过的路再走一遍
+        if r.get("invalidated"):
+            lines += ["", f"## 已作废 {len(r['invalidated'])} 条（这些路已经排除了，别再走）"]
+            for x in r["invalidated"][:12]:
+                lines.append(f"- {x['title']} —— {x['reason'] or '（没写原因，接手前先问清楚）'}")
         lines += ["", "## 先做这些"] + [f"{i}. {a}" for i, a in enumerate(r["actions"], 1)]
         lines += ["", "派新活之前先把上面处置完；否则你会对着一批已经停掉的子代理空等。"]
         return "\n".join(lines), r
@@ -848,7 +873,8 @@ def call(name, args):
             raise RuntimeError(f"找不到任务：{args['task']}")
         body = {k: args[k] for k in ("status", "progress", "blocked_reason", "milestone",
                                      "deliverable", "dod", "resource", "evidence", "estimate",
-                                     "paused", "due_at", "evidence_path", "abandoned_reason")
+                                     "paused", "due_at", "evidence_path", "abandoned_reason",
+                                     "verify_cmd", "verify_out")
                 if k in args}
         t = http("PATCH", "/api/tasks/" + target["id"], body)
         if isinstance(t, dict) and t.get("error"):
@@ -858,6 +884,8 @@ def call(name, args):
             extra.append(f"证据 {t['evidence']}")
         if t.get("deliverable_ok") is False:
             extra.append("交付物缺失 ✘")
+        if t.get("status") == "done":
+            extra.append("带证据 ✅" if t.get("verify_cmd") else "无证据 ⚠")
         if t.get("resource_conflict"):
             extra.append("资源冲突 ⚠")
         return (f"{t['title']} → {t['status']} {t['progress']}%"

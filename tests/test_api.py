@@ -85,15 +85,36 @@ def main():
         check("goal-bound task without milestone/deliverable/dod is rejected",
               code >= 400 and "milestone" in json.dumps(bad, ensure_ascii=False), bad)
 
+        doc = home / "api.md"
+        doc.write_text("# api\n", encoding="utf-8")
         code, task = call(base, "POST", f"/api/projects/{pid}/tasks",
                           {"title": "做接口", "assignee": mem2["id"], "estimate": 3,
-                           "milestone": "M1", "deliverable": "api.md", "dod": "200 on /x"})
+                           "milestone": "M1", "deliverable": str(doc), "dod": "200 on /x"})
         check("task created", code in (200, 201) and task.get("id"), task)
 
         code, state = call(base, "GET", f"/api/projects/{pid}")
         check("project state has stats/tasks/members",
               all(k in state for k in ("stats", "tasks", "members")), list(state)[:8])
         check("progress is numeric", isinstance(state["stats"].get("overall"), (int, float)), state["stats"])
+
+        # 「修好了」不值钱：done 必须带一条能重跑的命令，不然就是无证据完成
+        code, noev = call(base, "PATCH", f"/api/tasks/{task['id']}",
+                          {"status": "done", "progress": 100, "evidence": "observed",
+                           "evidence_path": str(doc)})
+        check("done without verify_cmd is rejected",
+              code >= 400 and noev.get("field") == "verify_cmd", noev)
+        code, okv = call(base, "PATCH", f"/api/tasks/{task['id']}",
+                         {"status": "done", "progress": 100, "evidence": "observed",
+                          "evidence_path": str(doc), "verify_cmd": "curl -s localhost/x",
+                          "verify_out": "200\nOK"})
+        check("done with verify_cmd lands and stamps verified_at",
+              code == 200 and okv.get("verify_cmd") and okv.get("verified_at"), okv)
+        code, st2 = call(base, "GET", f"/api/projects/{pid}")
+        check("a finished task with a command is not counted as evidence-less",
+              okv["id"] not in [t["id"] for t in st2["tasks"] if not t.get("verify_cmd")],
+              st2.get("done_without_evidence"))
+        # 回滚成 doing，后面的测试还要用它
+        call(base, "PATCH", f"/api/tasks/{task['id']}", {"status": "backlog", "progress": 0})
 
         # 编制冻结：批准单只能用一次、人名/岗位不能直接改
         code, reuse = call(base, "POST", f"/api/projects/{pid}/members",

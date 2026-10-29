@@ -1443,6 +1443,8 @@ function card(t){
     <div class="badgerow">
       ${t.milestone?`<span class="mchip">${esc(t.milestone)}</span>`:""}
       ${t.evidence?`<span class="echip ${t.evidence}">${t.evidence==="observed"?"实测":t.evidence==="inferred"?"推断":"假设"}</span>`:""}
+      ${t.status==="done"?`<span class="schip ${t.verify_cmd?"":"warn"}"
+        title="${t.verify_cmd?`可重跑：${esc(t.verify_cmd)}${t.verified_at?"　验于 "+esc(t.verified_at):""}`:"这条任务标了完成，但没有留下可重跑的命令 —— 无法判断是真验过还是口头说的"}">${t.verify_cmd?"✅ 带证据":"⚠ 无证据"}</span>`:""}
       ${t.resource?`<span class="rchip${t.resource_conflict?" bad":""}">${t.resource_conflict?"⚠ ":""}${esc(t.resource)}</span>`:""}
       ${t.stale_level&&t.stale_level!=="ok"?`<span class="schip ${t.stale_level}">停滞 ${fmtDur(t.stale_sec)}</span>`:""}
       ${t.status!=="done"&&t.eta_at?`<span class="schip eta ${etaCls(t)}"
@@ -1528,7 +1530,7 @@ function goalRender(){
         ✗ ${esc(c.text)}</span>`).join("")}
       ${leases.map(l=>`<span class="gate lease" title="${esc(l.note||"")}">
         🔒 ${esc(l.resource)} · ${esc(l.holder_title||l.holder_task||"未登记")}
-        ${l.expired?"（已过期）":`· 剩 <b data-cts="${l.until}">${cdText(l.until)}</b>`}
+        ${l.expired?`<span style="color:var(--coral)">（超时 ${l.overdue_min||0} 分钟未续期）</span>`:`· 剩 <b data-cts="${l.until}">${cdText(l.until)}</b>`}
         ${(l.queue||[]).length?`<span class="q">排队 ${l.queue.length}</span>`:""}</span>`).join("")}
     </div>`:""}
     <div class="goalcard">
@@ -1544,6 +1546,7 @@ function goalRender(){
           <div class="cdside">
             <div>截止 <b>${esc(p.deadline)}</b> · 时间已用 <b>${S.time_used_pct??0}%</b></div>
             <div>剩余工时估 <b>${S.remaining_hours??0}h</b> · 可用 <b>${S.hours_left>=0?S.hours_left:0}h</b></div>
+            ${S.critical_hours!=null?`<div>关键路径还需 <b style="color:${S.critical_gap>0?"var(--coral)":"var(--mint)"}">${S.critical_hours}h</b>${S.critical_gap!=null?`<span style="color:${S.critical_gap>0?"var(--coral)":"var(--ink-3)"}">（${S.critical_gap>0?"比剩余时间多":"比剩余时间少"} ${Math.abs(S.critical_gap)}h${S.critical_gap>0?" · 必须砍 scope":""}）</span>`:""}</div>`:""}
             ${S.eta_finish?`<div>串行排期预计收工 <b>${hhmm(S.eta_finish)}</b>${S.eta_slip_hours!=null
               ?`<span style="color:${S.eta_slip_hours>0?"var(--coral)":"var(--mint)"}">（比截止${S.eta_slip_hours>0?"晚":"早"} ${Math.abs(S.eta_slip_hours)}h）</span>`:""}</div>`:""}
             ${S.over_budget?`<div style="color:var(--coral)">⚠ 按现有任务，剩余工时已超出剩余时间</div>`:""}
@@ -1562,6 +1565,7 @@ function goalRender(){
           return `<span class="chip" title="配额 ${r.p1??30}/${r.p2??40}/${r.p3??30}%（总监在计划里填，看板照着切）">
             <b>P1 ${n1} · P2 ${n2} · P3 ${n3}</b>实排</span>`})()}
         <span class="chip ${S.over_budget?"blocked":""}"><b>${S.remaining_hours??0}</b>h 剩余工时</span>
+        ${S.critical_hours!=null?`<span class="chip ${S.critical_gap>0?"blocked":""}" title="关键路径 = 决定项目收工时刻的那条链，链尾还要多久"><b>${S.critical_hours}</b>h 关键路径${S.critical_gap>0?" · 超 "+S.critical_gap+"h":""}</span>`:""}
         ${S.over_budget?`<span class="chip blocked"><span class="d"></span>已超支</span>`:""}
         ${s.blocked?`<span class="chip blocked"><span class="d"></span>阻塞 ${s.blocked}</span>`:""}
       </div>
