@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.10 — the plan is a constraint, not a wall chart
+
+Two holes let a director skip the plan while looking productive.
+
+**Dependency order was advisory.** `blocked_upstream` was painted red on the card and nothing
+else — you could start the tail of the chain, finish it, and hand over "13 tasks done" while the
+head sat untouched. `status -> doing|done` now returns 400 with `need_force` when the upstream is
+not `done`, naming the task that blocks it. `force=true` still exists for genuinely parallel work,
+but it has to be argued for.
+
+**Nobody could see that the plan itself was stale.** `board.silent_sec` measures time since the
+last write that actually touches the plan — `task.*`, `member.update`, `criteria.upsert`,
+`retro.submitted`, `resource.*`, `hypothesis.added`. Deliberately excluded: `member.rebind`
+(automatic session binding), `autopilot.*` (config) and `project.updated` (renames, deadlines).
+Those would report "just now" for a director who has not opened the plan in thirteen hours —
+measured on the live project, 13h01m, while the health summary said everything lined up.
+
+It shows up in `health.summary`, the first line of `project_status`, and an amber banner in the
+panel, but only when `derail` is true.
+
 ## 0.3.9 — "0 working" must never read as "all fine"
 
 `idle` is now two signals instead of one. `warn` means nobody on the team is working and

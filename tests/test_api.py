@@ -310,6 +310,29 @@ def main():
         code, ap2 = call(base, "POST", f"/api/projects/{pid}/autopilot", {"action": "pause"})
         check("autopilot can be paused (status flips off ACTIVE)",
               code == 200 and (ap2.get("autopilot") or {}).get("status") == "PAUSED", ap2)
+
+        # 依赖顺序是硬约束，不是看板上的一个红点：
+        # 上游没完成就能开干/收工的话，「按计划推进」只是一句口号。
+        code, up = call(base, "POST", f"/api/projects/{pid}/tasks",
+                        {"title": "上游 A", "assignee": mem2["id"], "estimate": 1,
+                         "milestone": "M1", "deliverable": str(doc), "dod": "A 通过"})
+        code, down = call(base, "POST", f"/api/projects/{pid}/tasks",
+                          {"title": "下游 B", "assignee": mem2["id"], "estimate": 1,
+                           "milestone": "M1", "deliverable": str(doc), "dod": "B 通过",
+                           "depends_on": up["id"]})
+        code, blocked_by_dep = call(base, "PATCH", f"/api/tasks/{down['id']}",
+                                    {"status": "doing"})
+        check("a downstream task cannot start before its upstream is done",
+              code >= 400 and blocked_by_dep.get("need_force"), blocked_by_dep)
+        check("the refusal names the blocking upstream",
+              (blocked_by_dep.get("upstream") or {}).get("title") == "上游 A",
+              blocked_by_dep.get("upstream"))
+
+        # 总监「13 小时没碰计划」必须是一个看得见的数，不等于「全部对得上」
+        code, st2 = call(base, "GET", f"/api/projects/{pid}")
+        bd = st2.get("board") or {}
+        check("board tracks how long the plan has been untouched",
+              bd.get("silent_sec", -9) >= 0 and "threshold_sec" in bd, bd)
     finally:
         kill_board(base)
         try:

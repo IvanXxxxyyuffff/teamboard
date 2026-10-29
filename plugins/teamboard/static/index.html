@@ -762,6 +762,14 @@ function idleBanner(){
       <span class="who" id="idlewho" style="display:none">${who}</span>
     </div>`);
   }
+  const B=S.board||{};
+  if(B.derail){
+    rows.push(`<div class="idleb warn">
+      <span>⚠ <b>脱轨 ${esc(B.human)}</b>　总监 ${esc(B.human)}没碰过计划，
+      看板上的进度/排期/卡点都是过期数据</span>
+      <span class="more" title="最后一次：${esc(B.last_kind||'-')} @ ${esc(B.last_at||'-')}">最后一次</span>
+    </div>`);
+  }
   if(!A.found){
     rows.push(`<div class="idleb warn">
       <span>⚠ <b>没有自驱心跳</b>　你不出声，这一轮就永远不会再来一次；项目停在原地不是它慢，是它没被叫醒</span>

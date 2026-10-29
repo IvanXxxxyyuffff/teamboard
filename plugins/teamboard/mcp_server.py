@@ -148,6 +148,19 @@ def _autopilot_line(st):
     return f"自驱：每 {a.get('interval_min')} 分钟自动醒来一次，醒来先看团队板 ✅"
 
 
+def _board_line(st):
+    """总监多久没碰计划。这一行不是给用户看的漂亮话，是给总监照镜子用的。"""
+    b = st.get("board") or {}
+    if not b.get("derail"):
+        if b.get("silent_sec") and b["silent_sec"] > 0:
+            return f"计划：{b.get('human')}前更新过（{b.get('last_kind') or '-'}）"
+        return ""
+    return (f"⚠ 脱轨：总监 {b.get('human')}没碰过计划（最后一次 {b.get('last_kind') or '-'}，"
+            f"{b.get('last_at') or '—'}），手上还有 {b.get('open_tasks')} 条未收工。"
+            f"看板上的进度/排期/卡点全是过期数据，越看越像在推进。"
+            f"→ 先 update_task 报一次真实进度，再谈别的。")
+
+
 def summarize(p):
     st = http("GET", "/api/projects/" + p["id"])
     s = st["stats"]
@@ -156,6 +169,7 @@ def summarize(p):
              # 放在排期/进度前面是故意的：这两个数字都能在自己埋头干的时候慢慢变好，
              # 只有 idles 不会。总监最容易漏掉的就是这一行。
              _idle_line(st),
+             _board_line(st),
              _autopilot_line(st),
              f"目标：{p.get('goal') or '-'}" + (f"　截止：{p['deadline']}" if p.get("deadline") else ""),
              "排期：" + ("·".join(filter(None, [

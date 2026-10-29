@@ -109,6 +109,15 @@ COLUMNS = ["backlog", "doing", "review", "done", "blocked", "abandoned"]
 COL_LABEL = {"backlog": "待办", "doing": "进行中", "review": "待验收",
              "done": "已完成", "blocked": "阻塞", "abandoned": "已放弃"}
 HEARTBEAT_WINDOW = 300  # 心跳有效期：只有「没有进行中任务」时才用离线判定
+# 总监多久没碰计划 = 脱轨。停摆看的是「员工在不在动」，脱轨看的是
+# 「总监有没有在管这个计划」——两者可以同时为真，也可以单独发生：
+# 员工在干活、总监 13 小时不看计划，看板上的进度和排期就全是过期的。
+BOARD_SILENT_SEC = 2700
+# 算「碰计划」的事件。故意不含 member.rebind（自动绑会话）、autopilot.*
+# （配置）、project.updated（改名字/截止）——这些不是你回来管计划的证据。
+PLAN_KINDS = ("task.created", "task.updated", "task.done", "task.abandoned",
+              "member.update", "criteria.upsert", "retro.submitted",
+              "resource.claim", "resource.release", "hypothesis.added")
 DOING_STALE_SEC = 900   # doing 任务也有保质期：15 分钟既没会话写入也没心跳 = 僵尸任务
 # 总监在 Codex 里开了子代理却没给工位：这些会话和本项目工位同属一个父会话，
 # 10 分钟内还在写 = 现在真的有人在跑，只是看板上没有它的位置
@@ -1992,6 +2001,12 @@ def project_state(pid):
             "SELECT * FROM members WHERE project_id=? ORDER BY created_at", (pid,))]
         tasks = [dict(r) for r in c.execute(
             "SELECT * FROM tasks WHERE project_id=? ORDER BY sort_order, created_at", (pid,))]
+        # 总监最后一次「碰计划」是什么时候。只认改计划的事件：
+        # member.rebind / autopilot.* / project.updated 是自动或配置写入，
+        # 把它们算进来会让「13 小时没碰计划」显示成「刚刚」，等于又骗一次。
+        _q = "SELECT kind, created_at FROM events WHERE project_id=? AND kind IN (" \
+             + ",".join("?" * len(PLAN_KINDS)) + ") ORDER BY id DESC LIMIT 1"
+        last_plan = c.execute(_q, (pid, *PLAN_KINDS)).fetchone()
 
     now = time.time()
     workdir = (p["workdir"] if "workdir" in p.keys() and p["workdir"] else os.getcwd())
@@ -2655,6 +2670,15 @@ def project_state(pid):
     idle_warn = bool(workers and open_n
                      and not any(m["state"] == "working" for m in workers))
     idle_alert = bool(idle_warn and (idle_sec or 0) >= IDLE_ALERT_SEC)
+    # 脱轨：总监多久没碰过计划。它的存在意义是回答你那个问题——
+    # 「他会不会主动去看」→ 不会。所以看板只能把这个事实钉在墙上。
+    if last_plan:
+        board_silent = max(0, int(now - _epoch(last_plan["created_at"])))
+        last_plan_kind = last_plan["kind"]
+        last_plan_at = last_plan["created_at"]
+    else:
+        board_silent, last_plan_kind, last_plan_at = -1, "", ""
+    derail = bool(open_n and board_silent >= BOARD_SILENT_SEC)
     # 自驱：用户不说话时，谁能把这一轮叫醒。没有心跳 = 项目只在你开口时才存在。
     lead_m = next((m for m in members if m.get("is_lead")), None)
     auto = automation_status((lead_m or {}).get("thread_id") or "")
@@ -2714,6 +2738,15 @@ def project_state(pid):
                          key=lambda x: (x["silent"] < 0, -(x["silent"] or 0)))},
             # 自驱器：决定「用户不说话时项目会不会继续跑」
             "autopilot": auto,
+            # 脱轨：总监多久没碰计划。员工在干活也可能脱轨——那时候看板上的
+            # 进度、排期、卡点全是过期数据，越看越像在推进。
+            "board": {"silent_sec": board_silent,
+                      "human": _hm(board_silent) if board_silent and board_silent > 0 else "",
+                      "threshold_sec": BOARD_SILENT_SEC,
+                      "derail": derail,
+                      "last_kind": last_plan_kind,
+                      "last_at": last_plan_at,
+                      "open_tasks": open_n},
             # 编制：工位固定，会话可换。加人/换人/撤编都挂在这张申请单上等用户批
             "staff_requests": sreq,
             "staff_pending": [s for s in sreq if s["status"] == "pending"],
@@ -3272,6 +3305,23 @@ def update_task(tid, b):
                                  "先让占用方收工，或确认共享后再带 force=true",
                         "field": "resource", "need_approval": True,
                         "holder": {"id": h["id"], "title": h["title"]}}
+        # 依赖顺序：上游没完成就开干/收工，等于把计划当墙纸。
+        # 之前只在看板上画个红点（blocked_upstream），那是建议不是约束——
+        # 总监完全可以先做链尾，然后把「完成 13 条」摆给你看。
+        if st in ("doing", "done") and st != t["status"] and not b.get("force"):
+            dep = (b.get("depends_on") or t["depends_on"] or "").strip()
+            if dep:
+                with db() as c2:
+                    up = c2.execute("SELECT title,status FROM tasks WHERE id=?"
+                                    " AND project_id=?",
+                                    (dep, t["project_id"])).fetchone()
+                if up and up["status"] != "done":
+                    return {"error": f"上游「{up['title']}」还没完成（{up['status']}），"
+                                     f"这条不能进 {st}。先把上游推完；确认串行是多余的，"
+                                     f"带 force=true 并说明理由。",
+                            "field": "depends_on", "need_force": True,
+                            "upstream": {"id": dep, "title": up["title"],
+                                         "status": up["status"]}}
         # 放弃必须写原因：换人/换模型接手时，这条比任何进度都有用
         if st == "abandoned":
             reason = (b.get("abandoned_reason") or t["abandoned_reason"] or "").strip()
@@ -3466,6 +3516,8 @@ def project_health(pid, st=None):
                  ("0 人在干活" if (st.get("idle") or {}).get("warn") else "")),
                 ("没有自驱心跳，用户不出声项目就停"
                  if not (st.get("autopilot") or {}).get("ready") else ""),
+                (f"总监 {st['board']['human']}没碰计划"
+                 if (st.get("board") or {}).get("derail") else ""),
                 f"{len(stale)} 个工位已静默" if stale else "",
                 f"{len(orphan_tasks)} 条任务无主" if orphan_tasks else "",
                 f"{len(unseated)} 个会话没登记工位" if unseated else "",
