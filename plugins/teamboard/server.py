@@ -3237,7 +3237,7 @@ def _safe_stdio():
     """Windows 控制台默认 cp1252：横幅里的「→」会让进程在 serve 之前直接死掉。"""
     for st in (sys.stdout, sys.stderr):
         try:
-            st.reconfigure(errors="replace")
+            st.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
 

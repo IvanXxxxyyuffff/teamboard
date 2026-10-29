@@ -20,7 +20,7 @@ class MCP:
     def __init__(self, env):
         self.p = subprocess.Popen([PYTHON, str(PLUGIN / "mcp_server.py")],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, env=env, text=True, bufsize=1)
+                                  stderr=subprocess.PIPE, env=env, text=True, encoding="utf-8", errors="replace", bufsize=1)
         self.n = 0
 
     def rpc(self, method, params=None, timeout=30):

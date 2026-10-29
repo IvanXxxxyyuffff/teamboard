@@ -18,6 +18,8 @@ import json, os, socket, subprocess, sys, time, urllib.request, urllib.error
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER_PY = os.path.join(HERE, "server.py")
 HOME = os.environ.get("TEAMBOARD_HOME") or os.path.join(HERE, ".teamboard")
+# 有 HTTP_PROXY 的机器上，urllib 默认把 127.0.0.1 也交给代理 → 本机探活永远超时
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def _log(msg):
@@ -27,7 +29,7 @@ def _log(msg):
 def _health(base, timeout=0.6):
     """True only if a TeamBoard board answers there (not just any server)."""
     try:
-        with urllib.request.urlopen(base + "/api/health", timeout=timeout) as r:
+        with _OPENER.open(base + "/api/health", timeout=timeout) as r:
             return json.loads(r.read() or b"{}").get("app") == "teamboard"
     except Exception:
         return False

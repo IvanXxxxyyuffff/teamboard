@@ -15,7 +15,9 @@ UI_URI = "ui://teamboard/panel9"   # v4: 面板改为经 MCP 代理取数（沙�
 HERE = os.path.dirname(os.path.abspath(__file__))
 UI_FILE = os.path.join(HERE, "ui", "panel.html")
 UI_MIME = "text/html;profile=mcp-app"
-UI_META = {"ui": {"resourceUri": UI_URI}}   # 带这个 meta 的工具，结果会直接在会话里渲染成面板
+UI_META = {"ui": {"resourceUri": UI_URI}}
+# 有 HTTP_PROXY 的机器上，urllib 默认把 127.0.0.1 也交给代理 → 本地看板永远超时。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # 带这个 meta 的工具，结果会直接在会话里渲染成面板
 
 
 def log(*a):
@@ -27,7 +29,7 @@ def http(method, path, body=None):
     req = urllib.request.Request(BASE + path, data=data, method=method,
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=15) as r:
+        with _OPENER.open(req, timeout=15) as r:
             raw = r.read()
         return json.loads(raw) if raw[:1] in (b"{", b"[") else raw.decode()
     except urllib.error.HTTPError as e:

@@ -5,6 +5,10 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 PLUGIN = ROOT / "plugins" / "teamboard"
 PYTHON = sys.executable
 
+# macOS 托管 runner 会设 HTTP_PROXY/HTTPS_PROXY：uranium 会把 127.0.0.1 也交给代理，
+# 于是「服务起来了」变成「请求超时」。所有 loopback 请求显式禁用代理。
+OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 def free_port():
     with socket.socket() as s:
@@ -32,7 +36,7 @@ def call(base, method, path, body=None, timeout=10):
     req = urllib.request.Request(base + path, data=data, method=method,
                                  headers={"Content-Type": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
+        with OPENER.open(req, timeout=timeout) as r:
             return r.status, json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         raw = e.read()
