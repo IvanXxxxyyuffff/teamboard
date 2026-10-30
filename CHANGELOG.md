@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.3.18 — an empty chair is not a headcount
+
+Two things the nudge was getting wrong about idle capacity.
+
+**Vacant seats are now named.** A seat with no bound thread, no doing task and no load is not
+"quiet", it is a chair nobody is sitting in — it consumes a slot from the roster while producing
+nothing, and it is invisible in every other view because there is no session to look stale.
+
+**New work goes to whoever is actually free.** The nudge used to hand the next backlog item to
+the first non-working member, which could be a seat already stuck with an unreclaimed `doing`
+task. Adding another task to a blocked pipe is not scheduling; it just makes the board look
+staffed. The first pick is now a member with nothing in hand, and only if none exists does it
+fall back to the merely idle.
+
 ## 0.3.17 — the hook pays rent
 
 The PreToolUse guard used to only take: it read the board on every write tool and either allowed

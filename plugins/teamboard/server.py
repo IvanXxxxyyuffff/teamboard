@@ -2999,11 +2999,31 @@ def project_state(pid):
         _nitem("nosession", x["name"], f"有活没绑会话：{x['task']}",
                f"bind_member(member_id='{x.get('id','')}', thread_id='<全 UUID>')",
                0, x.get("task_id", ""), x.get("id", ""))
+    # 空椅子：既没有会话，也没有任务。它占着编制却不产出，是「4 个人 3 个摸鱼」里
+    # 最隐蔽的一种——另外两种至少还能看见人在不在，这种连会话都没有。
+    for m in workers:
+        if (m.get("thread_id") or "").strip():
+            continue
+        # 名下有 backlog 不算「有人在干」：椅子还是空的，只是活先堆在上面了。
+        if any(t.get("assignee_id") == m["id"] and t["status"] in REGISTERED
+               for t in tasks):
+            continue
+        parked = len([t for t in tasks if t.get("assignee_id") == m["id"]
+                      and t["status"] == "backlog"])
+        _nitem("vacant", m.get("name") or "?",
+               (f"空工位 {m.get('seat_label') or ''}：没绑会话"
+                + (f"，名下 {parked} 条待办没人推" if parked else "，也没有任何任务")),
+               f"要么 spawn 一个子代理后 bind_member(member_id='{m.get('id','')}', "
+               f"thread_id='<全 UUID>')，要么走撤编审批把编制让出来——空椅子不算生产力",
+               0, "", m.get("id", ""))
     # 有人闲着、账上还有待办：这是最该先说的一句——它在浪费编制
     idle_workers = [m for m in workers if m["state"] != "working"]
+    # 优先派给「名下真没活」的人：把新任务塞给一个还挂着 doing 的僵住工位，
+    # 等于在已经堵住的管子上再加一段，账面上有人接了，实际还是没人动。
+    free_workers = [m for m in idle_workers if not m.get("doing_tasks")]
     backlog_tasks = [t for t in open_tasks if t["status"] == "backlog"]
     if backlog_tasks and idle_workers:
-        t0, m0 = backlog_tasks[0], idle_workers[0]
+        t0, m0 = backlog_tasks[0], (free_workers or idle_workers)[0]
         _nitem("unassigned", m0.get("name") or "?",
                f"{len(backlog_tasks)} 条待办没人接，{len(idle_workers)} 个员工闲着",
                f"把「{t0['title'][:20]}」派给 {m0.get('name')}：update_task(task='{t0['id']}', "
