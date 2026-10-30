@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.13 — "written" is not "done"
+
+Two remaining holes on the delivery surface, both reachable from the API.
+
+**A task nobody ever ran could be marked done.** `done` checked evidence, evidence path,
+verify command and deliverable — all of which a model can produce without ever starting the
+task. Execution trace is now a prerequisite: no `task_sessions` row, `time_spent == 0` and
+`doing_since == 0` means nobody ever worked on it, so `PATCH status=done` returns
+`need_execution` (400). Importing historical work is still possible with `force=true`.
+
+**A task could be born done or born in-progress.** `POST /tasks {status:"done"}` skipped every
+`done` check; `{status:"doing"}` skipped `ack_gate` and dependency order. Both are now rejected:
+create in `backlog`, assign it, then finish it through the normal path.
+
+Net effect: the delivery surface has exactly one legal route —
+**assign → start → execution record → close with evidence**.
+
+Tests: create-as-done rejected; `PATCH done` without execution returns `need_execution`;
+`doing` → evidence → done passes.
+
 ## 0.3.12 — a decision the director never read is not a decision
 
 Two gaps, both measured on a live project.

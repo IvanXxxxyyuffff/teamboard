@@ -3446,6 +3446,26 @@ def add_task(pid, b):
     status = b.get("status", "backlog")
     if status not in COLUMNS:
         return {"error": f"status must be one of {COLUMNS}"}
+    # 不能「建成即完成」：绕开 doing 就没有执行记录、没有证据校验，
+    # 交付面等于敞开。要完成请先建成 backlog/doing，再用 PATCH 带证据置 done。
+    if status == "done":
+        return {"error": "任务不能直接建成已完成：先建 backlog（或 doing 派给人），"
+                         "做完再用 PATCH status=done 带 evidence/verify_cmd 收工。",
+                "field": "status"}
+    # 建成即开工同样要走闸：欠回执 / 上游没完成，都不能靠「新建一条 doing」绕过。
+    if status == "doing":
+        gate = ack_gate(pid)
+        if gate:
+            return gate
+        dep = (b.get("depends_on") or "").strip()
+        if dep:
+            with db() as c1:
+                up = c1.execute("SELECT title,status FROM tasks WHERE id=? AND project_id=?",
+                                (dep, pid)).fetchone()
+            if up and up["status"] != "done":
+                return {"error": f"上游「{up['title']}」还没完成（{up['status']}），"
+                                 f"这条不能直接建成 doing。", "field": "depends_on",
+                        "need_force": True, "upstream": {"title": up["title"]}}
     bad = check_links(None, pid, b.get("assignee_id"), b.get("depends_on"))
     if bad:
         return bad
@@ -3569,6 +3589,16 @@ def update_task(tid, b):
         if st == "done" and not b.get("force"):
             ev = (b.get("evidence") or t["evidence"] or "").strip()
             ep = (b.get("evidence_path") or t["evidence_path"] or "").strip()
+            # 交付必须留下执行痕迹：从没进过 doing、也没计过时的任务，
+            # 说明没有任何人在它上面跑过——那不是「做完了」，是「写完了」。
+            # 这一条是「必须经过插件」最硬的落地：不挂号就交不了。
+            has_run = bool(c.execute("SELECT 1 FROM task_sessions WHERE task_id=? LIMIT 1",
+                                     (tid,)).fetchone())
+            if not has_run and not (t["time_spent"] or 0) and not (t["doing_since"] or 0):
+                return {"error": "这条任务没有任何执行记录（没进过 doing、也没计过时），不能标完成。"
+                                 "先 status=doing + assignee_id 派给具体的人，让他真跑一遍；"
+                                 "确有特殊情况（历史任务补录）带 force=true",
+                        "field": "execution", "need_execution": True}
             if not ev:
                 return {"error": "标完成必须带 evidence（observed / inferred / assumed）",
                         "field": "evidence", "need_evidence": True}

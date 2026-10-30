@@ -276,7 +276,7 @@ spawn 时 `on:true`，收工 `on:false`。它决定面板显示「工作中」�
 
 可选：`priority`、`estimate`（加权进度用）、`resource`、`evidence`。
 
-## 六个硬闸
+## 七个硬闸
 
 1. **交付物存在性**：`deliverable` 支持 `a|b`、`a + b`、`{X,Y}.md`、通配符；
    相对路径按 `project.workdir` 解析。一个文件都不存在时，`status=done` 会被拒绝（400）。
@@ -290,6 +290,10 @@ spawn 时 `on:true`，收工 `on:false`。它决定面板显示「工作中」�
    返回三张清单 + `next_actions`；三项都空才算对齐（`align.ok=true`）。
 6. **审批回执**：用户点过批准/驳回、总监没 `ack` → 改任务状态 / 提新计划 / 导报告 403
    `need_ack`。决定不落进脑子，等于没决定。
+7. **执行痕迹**：从没进过 `doing`、也没计过时的任务不许标 `done`（400 `need_execution`）。
+   没有 `task_sessions` 记录、`time_spent=0`、`doing_since=0`，就说明没人在这条任务上跑过，
+   「写完了」不等于「做完了」。任务**不能建成 `done`**，建成 `doing` 也要过 `ack_gate`
+   与依赖顺序。合法路径只有一条：派人 → 挂 `doing` → 真跑 → 带证据 `PATCH status=done`。
 
 ## 进度与停滞
 
@@ -426,10 +430,12 @@ POST /api/projects/{pid}/resources/{name}/release {"task_id":"…"}
 - 目标页顶部会出现 `🔒 emulator-5556 · 持有任务 · 剩 42m · 排队 2`；
 - 真要共享才带 `force=true`，并在计划里写原因。
 
-## 置 done 的两道硬闸
+## 置 done 的三道硬闸
 
 1. `evidence` 必填（observed / inferred / assumed）；
-2. `evidence_path` 必填，且**文件/目录必须真实存在**（支持 `a|b`、通配符）。
+2. `evidence_path` 必填，且**文件/目录必须真实存在**（支持 `a|b`、通配符）；
+3. **有执行痕迹**：必须真的进过 `doing`（`task_sessions` 有记录或 `time_spent>0`），
+   否则 400 `need_execution`。
 
 缺任一项 → 400 + `need_evidence`。确实要跳过才带 `force=true`。
 `inferred` 仍然不许 ≥90%。

@@ -101,6 +101,8 @@ def main():
         check("progress is numeric", isinstance(state["stats"].get("overall"), (int, float)), state["stats"])
 
         # 「修好了」不值钱：done 必须带一条能重跑的命令，不然就是无证据完成
+        # 先真开工一次：没有执行记录的任务不许直接标完成（否则「写完了」＝「做完了」）
+        call(base, "PATCH", f"/api/tasks/{task['id']}", {"status": "doing"})
         code, noev = call(base, "PATCH", f"/api/tasks/{task['id']}",
                           {"status": "done", "progress": 100, "evidence": "observed",
                            "evidence_path": str(doc)})
@@ -433,6 +435,24 @@ def main():
         code, st6 = call(base, "GET", f"/api/projects/{pid3}")
         check("an acknowledged decision is not re-counted",
               not (st6.get("need_ack") or []), st6.get("need_ack"))
+
+        # 交付面最硬的一条：没进过 doing 的任务不许标完成。
+        # 「写完了」不等于「做完了」——没有执行记录，就没有任何人在它上面跑过。
+        code, t4 = call(base, "POST", f"/api/projects/{pid3}/tasks",
+                        {"title": "没开过工的任务", "assignee": w3["id"], "estimate": 1,
+                         "milestone": "M1", "deliverable": str(doc), "dod": "x"})
+        code, no_run = call(base, "PATCH", f"/api/tasks/{t4['id']}",
+                            {"status": "done", "progress": 100, "evidence": "observed",
+                             "evidence_path": str(doc), "verify_cmd": "true"})
+        check("a task nobody ever started cannot be marked done",
+              code in (400, 403) and no_run.get("need_execution"), no_run)
+        code, done_direct = call(base, "POST", f"/api/projects/{pid3}/tasks",
+                                 {"title": "直接建成完成", "assignee": w3["id"], "estimate": 1,
+                                  "milestone": "M1", "deliverable": str(doc), "dod": "x",
+                                  "status": "done"})
+        check("a task cannot be created already-done",
+              code >= 400 and "已完成" in json.dumps(done_direct, ensure_ascii=False),
+              done_direct)
     finally:
         kill_board(base)
         try:
