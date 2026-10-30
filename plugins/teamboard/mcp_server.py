@@ -286,6 +286,32 @@ _MEMBER_KEEP = ("id", "name", "seat_no", "role", "state", "turn", "state_source"
                 "session_silent", "away_for")
 
 
+def compact_overview(d):
+    """总览只回答「我有哪些团队、各自什么样」。
+
+    整行 projects 带上 goal + 每个成员 + 角色表时装一次 6.4KB／项目；
+    项目一多，光看一眼总览就吃掉半个上下文窗口。细节留给 project_status。
+    """
+    out = {"agg": d.get("agg"), "projects": []}
+    for p in d.get("projects") or []:
+        s = p.get("stats") or {}
+        row = {"id": p.get("id"), "name": p.get("name"),
+               "goal": (p.get("goal") or "")[:180],
+               "deadline": p.get("deadline"), "hours_left": p.get("hours_left"),
+               "pressure": p.get("pressure"), "retro_required": p.get("retro_required"),
+               "pending_approvals": len(p.get("pending_approvals") or []),
+               "stats": {k: s.get(k) for k in
+                         ("overall", "done", "total", "doing", "blocked", "members")
+                         if k in s},
+               "health": (p.get("health") or {}).get("summary") or "",
+               "unseated": len(p.get("unseated") or []),
+               "resume_pending": bool((p.get("resume") or {}).get("needs_reconcile"))}
+        out["projects"].append(row)
+    first = out["projects"][0]["id"] if out["projects"] else ""
+    out["board_url"] = (BASE + "/board?pid=" + first) if first else BASE + "/"
+    return out
+
+
 def compact_state(st):
     """默认不把整张任务表塞回上下文：一次 project_status 曾经要吃掉 40KB。
 
@@ -739,9 +765,7 @@ def call(name, args):
             lines.append(f"⚠ {'、'.join(stuck)} 有 doing 任务的人已经不在岗。"
                          "先 resume_brief 处置，再派新活。")
         text = "\n".join(lines)
-        first = d["projects"][0]["id"] if d["projects"] else ""
-        return text, {"projects": d["projects"], "agg": d["agg"],
-                      "board_url": (BASE + "/board?pid=" + first) if first else BASE + "/"}
+        return text, compact_overview(d)
 
     if name == "project_status":
         p = pick_project(args.get("project", ""))

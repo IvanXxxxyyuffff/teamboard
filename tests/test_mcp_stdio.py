@@ -90,6 +90,17 @@ def main():
         check("compact: nudge say truncated",
               all(len(x["say"]) <= 130 for x in compact["nudge"]["items"]),
               compact["nudge"]["items"][:1])
+        ov = mod.compact_overview({"agg": {"projects": 1},
+                                   "projects": [{"id": "p1", "name": "n" * 40,
+                                                 "goal": "g" * 900,
+                                                 "roles": [{"x": "y" * 200}] * 12,
+                                                 "members": [{"x": "y" * 200}] * 5,
+                                                 "stats": {"overall": 50, "done": 1, "total": 2,
+                                                           "doing": 1, "blocked": 0, "members": 3},
+                                                 "health": {"summary": "全部对得上"}}]})
+        check("compact_overview: one project < 1.5KB",
+              len(json.dumps(ov, ensure_ascii=False).encode()) < 1500,
+              len(json.dumps(ov, ensure_ascii=False).encode()))
 
         r = m.rpc("resources/list")
         res = r.get("result", {}).get("resources", [])
