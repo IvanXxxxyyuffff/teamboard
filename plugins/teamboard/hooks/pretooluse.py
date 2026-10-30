@@ -10,17 +10,24 @@ Codex 的 PreToolUse 钩子跑在工具真正执行之前，是唯一能堵住�
   2. 只拦已经在看板上登记过的工位会话：没登记的会话不管（它们由 unseated 报警处理）。
   3. 项目总监放行：它的活是调度，不是执行。
   4. 工位名下没有任何 doing 任务 → 拒绝，并给出该调的那一条命令。
-  5. 任何异常（看板没起、超时、JSON 解析失败）一律放行：闸门故障不能变成全站瘫痪。
+  5. 已挂号工位每跑一次动手工具，顺手打一次心跳（20 秒节流）：这是「在干活却显示摸鱼」的根治。
+  6. 任何异常（看板没起、超时、JSON 解析失败）一律放行：闸门故障不能变成全站瘫痪。
+
+每次裁决都写一行到 /tmp/teamboard-hook.log —— 钩子有没有被宿主真正调用过，只能靠它证明。
 
 退出约定：输出 {"decision":"deny","reason":"..."} 即拦住；什么都不输出即放行。
 """
 import json
 import os
 import sys
+import time
 import urllib.request
 
 BASE = os.environ.get("TEAMBOARD_URL", "http://127.0.0.1:8787").rstrip("/")
 TIMEOUT = 1.2
+LOG = os.environ.get("TEAMBOARD_HOOK_LOG", "/tmp/teamboard-hook.log")
+BEAT_CACHE = "/tmp/teamboard-hook-beat.json"
+BEAT_EVERY = 20.0
 # 这些是「动手」工具：读代码、改文件、跑命令。查/派/批不在此列。
 WORK_TOOLS = {"bash", "apply_patch", "applypatch", "exec", "exec_command",
               "shell", "run_command", "write", "write_file", "edit", "edit_file"}
@@ -32,6 +39,48 @@ def out(obj):
     return 0
 
 
+def log(tool, sid, decision, extra=""):
+    """留痕。失败绝不影响放行。"""
+    try:
+        if os.path.exists(LOG) and os.path.getsize(LOG) > 262144:
+            open(LOG, "w").close()
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                "tool": tool, "sid": (sid or "")[:8],
+                                "ppid": os.getppid(), "decision": decision,
+                                "extra": extra}, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def beat(mid, sid):
+    """已挂号工位跑一次动手工具 = 报一次活。前提是它真的在做被派的那条任务。"""
+    if not mid:
+        return False
+    try:
+        cache = json.loads(open(BEAT_CACHE, encoding="utf-8").read() or "{}")
+    except Exception:
+        cache = {}
+    now = time.time()
+    if now - float(cache.get(sid) or 0) < BEAT_EVERY:
+        return True
+    try:
+        req = urllib.request.Request(
+            f"{BASE}/api/members/{mid}/heartbeat", data=b"{}",
+            headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=TIMEOUT).read()
+    except Exception:
+        return False
+    try:
+        cache = {k: v for k, v in cache.items() if now - float(v or 0) < 600}
+        cache[sid] = now
+        with open(BEAT_CACHE, "w", encoding="utf-8") as f:
+            f.write(json.dumps(cache))
+    except Exception:
+        pass
+    return True
+
+
 def main():
     try:
         raw = sys.stdin.read() or "{}"
@@ -40,30 +89,40 @@ def main():
         return out({})                      # 解析不了就放行
 
     tool = str(d.get("tool_name") or d.get("toolName") or "").split(".")[-1].lower()
-    if tool not in WORK_TOOLS:
-        return out({})
-
     sid = (d.get("session_id") or d.get("sessionId") or "").strip()
+
+    if tool not in WORK_TOOLS:
+        log(tool, sid, "pass:not-work-tool")
+        return out({})
     if not sid:
+        log(tool, sid, "pass:no-session")
         return out({})
 
     try:
         with urllib.request.urlopen(f"{BASE}/api/threads/{sid}", timeout=TIMEOUT) as f:
             info = json.loads(f.read() or b"{}")
     except Exception:
+        log(tool, sid, "pass:board-down")
         return out({})                      # 看板没起：放行，别让闸门故障拖垮 App
 
     if not info.get("found"):
+        log(tool, sid, "pass:unregistered")
         return out({})                      # 没登记的会话不归这个闸管
     m = info.get("member") or {}
     if m.get("is_lead"):
+        log(tool, sid, "pass:lead")
         return out({})                      # 项目总监放行
 
-    if info.get("doing"):
+    doing = info.get("doing") or []
+    if doing:
+        mid = m.get("id") or ""
+        wrote = beat(mid, sid)
+        log(tool, sid, "pass:seated" + ("" if wrote else "+beat-fail"), mid)
         return out({})                      # 已挂号：放行
 
     name = m.get("name") or "这个工位"
     mid = m.get("id") or "<member_id>"
+    log(tool, sid, "deny", str(m.get("name") or ""))
     return out({"decision": "deny",
                 "reason": (f"[TeamBoard] {name} 还没在看板上挂号。先认领一条任务再动手："
                            f"update_task(assignee_id='{mid}', status='doing', task='<任务id>')；"

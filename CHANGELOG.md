@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.17 — the hook pays rent
+
+The PreToolUse guard used to only take: it read the board on every write tool and either allowed
+or denied. Now it gives something back.
+
+**A seated member beats by working.** Every allowed write tool from a member that already holds a
+`doing` task also refreshes that member's heartbeat (20s throttle). Subagents never call
+`heartbeat` on their own, which is why a worker running commands for twenty minutes could still
+be drawn as `摸鱼中`. The hook is the one place every tool call must pass through, so it is the
+only place this can be fixed for good.
+
+**Every decision is logged** to `/tmp/teamboard-hook.log` (`pass:lead` / `pass:seated` /
+`pass:unregistered` / `deny` / `pass:board-down`, plus tool and session). Whether a host hook is
+actually being invoked cannot be proven from the outside; this file is the proof, and the first
+thing to check when a guard "does not seem to work".
+
+**State no longer flickers between working and stuck.** A subagent that ends one turn and starts
+the next a few seconds later used to flip `working → stale → working` on every poll, because a
+`task_complete` tail immediately meant "nobody is here". Terminal events now get a 20s grace
+window before they count as a dead seat — measured on a real team where one seat flipped twice in
+four seconds.
+
 ## 0.3.16 — never start over
 
 A task that is half done is an asset, and restarting it from zero throws that asset away. Three

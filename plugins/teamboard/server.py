@@ -2351,7 +2351,12 @@ def project_state(pid):
                                      if tail.get("epoch") else -1)
             if ttype in TERMINAL_EVENTS:
                 m["session_ended"] = ttype
-                m["session_live"] = False
+                # 一轮收工到下一轮开始可能只隔几秒（子代理被总监连续唤醒）。
+                # 立刻判死会让状态在「工作中 / 僵住」之间每几秒闪一次——
+                # 实测 dev_line 在 4 秒内两连跳，用户看到的就是「明明在干活却显示摸鱼」。
+                # 给 20 秒缓冲：超过 20 秒还停在收工事件上，才是真的没人了。
+                if (now - (tail.get("epoch") or 0)) > 20:
+                    m["session_live"] = False
             elif ttype in IDLE_TAIL:
                 m["session_awaiting"] = True        # 用户刚发、agent 还没动
                 m["session_live"] = False
