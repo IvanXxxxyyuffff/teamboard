@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.20 — a button that does something
+
+Two chips on the nudge and align banners ("现在该做" / "怎么修") looked like buttons and were
+tooltips. Clicking them did nothing, which is worse than not having them: the one place the board
+tells you what to do next was the one place that could not be used.
+
+**They open a sheet now.** The full list — every nudge item with the command it wants, or every
+un-aligned seat with the exact three-step fix (handover → reassign with a note → or abandon with a
+reason) — and a copy button per row.
+
+**Copy, not edit.** The board stays read-only for the person watching it. The only useful verb on
+this screen is "take the command and give it to the director", so that is the button.
+
 ## 0.3.19 — take the work over, do not sweep it away
 
 A stalled seat is not junk. Recycling its task to `backlog` is irreversible: whatever it already

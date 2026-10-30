@@ -758,7 +758,7 @@ function idleBanner(){
     const ago=N.human?("（最久 "+esc(N.human)+"）"):"";
     rows.push('<div class="idleb '+(N.level==="shout"?"bad":"warn")+'">'
       +'<span>⏰ <b>催办 '+N.count+' 条'+ago+'</b>　'+who+'</span>'
-      +'<span class="more" title="'+esc(N.must||"")+'">现在该做</span>'
+      +'<span class="more" onclick="nudgeDetail()">现在该做</span>'
       +'</div>');
   }
   if(I.warn){
@@ -797,7 +797,7 @@ function idleBanner(){
     rows.push(`<div class="idleb bad">
       <span>⛔ <b>团队没对齐看板</b>　${bits.join("；")}
       　→ 开新计划 / 加人 / 导报告都会被拒绝</span>
-      <span class="more" title="先 update_task(status='doing', assignee_id=<mid>)，再 member_duty(on=true)">怎么修</span>
+      <span class="more" onclick="alignDetail()">怎么修</span>
     </div>`);
   }
   if(B.derail){
@@ -831,6 +831,79 @@ function idleBanner(){
 function idleDetail(){
   const el=document.getElementById("idlewho");
   if(el) el.style.display=el.style.display==="none"?"inline":"none";
+}
+
+/* 催办 / 对齐全量清单。以前这两个「按钮」只是一个 title 气泡——点了什么都不发生，
+   用户当然要问「我点它有啥用」。看板是只读的，人能做的最有用的事只有一件：
+   把该打的命令原样复制出去交给总监。 */
+function showSheet(title, rows){
+  let o=document.getElementById("tbsheet");
+  if(!o){
+    o=document.createElement("div"); o.id="tbsheet";
+    o.style.cssText="position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.55);"
+      +"display:flex;align-items:flex-end;justify-content:center";
+    o.onclick=e=>{ if(e.target===o) o.remove(); };
+    document.body.appendChild(o);
+  }
+  window._sheetRows=rows;
+  o.innerHTML='<div style="background:#15171a;color:#e8eaed;border:1px solid #2a2e33;'
+    +'border-radius:16px 16px 0 0;max-width:860px;width:100%;max-height:72vh;overflow:auto;'
+    +'padding:16px 18px;font:13px/1.6 -apple-system,BlinkMacSystemFont,sans-serif">'
+    +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">'
+    +'<b style="font-size:15px">'+esc(title)+'</b>'
+    +'<span style="margin-left:auto;cursor:pointer;color:#8a9199" '
+    +'onclick="document.getElementById(\'tbsheet\').remove()">关闭</span></div>'
+    + rows.map((r,i)=>'<div style="border:1px solid #262a2f;border-radius:10px;'
+      +'padding:10px 12px;margin-bottom:8px">'
+      +'<div style="color:#8a9199;font-size:12px;margin-bottom:5px">'+esc(r.label)+'</div>'
+      +'<div style="white-space:pre-wrap;word-break:break-word">'+esc(r.text)+'</div>'
+      +'<div style="text-align:right;margin-top:6px">'
+      +'<span style="cursor:pointer;color:#c6f24e;font-size:12px" onclick="copyLine('+i+')">复制</span>'
+      +'</div></div>').join("")
+    +'</div>';
+}
+
+function copyLine(i){
+  const r=(window._sheetRows||[])[i];
+  if(!r) return;
+  const done=()=>toast("已复制，粘给总监即可","ok");
+  const fail=()=>toast("复制失败：手动选一下上面的文字","bad");
+  if(navigator.clipboard&&navigator.clipboard.writeText){
+    navigator.clipboard.writeText(r.text).then(done,fail);
+  }else{
+    const ta=document.createElement("textarea");
+    ta.value=r.text; document.body.appendChild(ta); ta.select();
+    try{ document.execCommand("copy"); done(); }catch(e){ fail(); }
+    ta.remove();
+  }
+}
+
+function nudgeDetail(){
+  const N=S.nudge||{};
+  const rows=(N.items||[]).map(x=>({
+    label:[x.kind||"",x.who||"",(x.age_sec?dur(x.age_sec):"")].filter(Boolean).join(" · "),
+    text:x.say||x.what||""}));
+  showSheet("现在该做（"+rows.length+" 条）", rows);
+}
+
+function alignDetail(){
+  const A=S.align||{}; const rows=[];
+  (A.ghost||[]).forEach(g=>rows.push({
+    label:"任务主人已停 · "+g.name+" · "+g.task,
+    text:"1) 先接手，别直接回收：\n   GET /api/tasks/"+g.task_id+"/handover\n"
+      +"   他最后一句："+((g.last_say||"（无记录，先看产物和日志）").slice(0,160))+"\n"
+      +"2) 能继续 → 改派并写断点：\n   update_task(task='"+g.task_id
+      +"', assignee_id='<新人>', status='doing', resume_note='从这里的下一步开始')\n"
+      +"3) 确实作废 → update_task(task='"+g.task_id+"', status='abandoned', "
+      +"abandoned_reason='为什么不再需要')"}));
+  (A.unlogged||[]).forEach(u=>rows.push({
+    label:"在跑没挂号 · "+u.name+"（静默 "+(u.silent>=0?dur(u.silent):"未知")+"）",
+    text:"update_task(assignee_id='"+u.id+"', status='doing', task='<任务id>')\n"
+      +"member_duty(member='"+u.id+"', on=true)"}));
+  (A.nosession||[]).forEach(x=>rows.push({
+    label:"有活没绑会话 · "+x.name+" · "+x.task,
+    text:"bind_member(member_id='"+x.id+"', thread_id='<全 UUID>')"}));
+  showSheet("怎么修（"+rows.length+" 条）", rows);
 }
 
 async function autopilotFix(action){
