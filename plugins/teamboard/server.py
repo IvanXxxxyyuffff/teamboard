@@ -1303,6 +1303,55 @@ def upsert_criteria(pid, b):
     return {"ok": True, "ids": out}
 
 
+def run_criteria(pid, b=None):
+    """把带 cmd 的验收条目真跑一遍，读数与时间一起写回去。
+
+    为什么要这个：criteria 的红绿以前只能靠人手动 mark，结果卡片上的
+    「主线 16/163」可以是几小时前的读数，而项目已经推到 32/163。
+    约定：命令退出码 0 = green，非 0 = red（超时按 red 记）。
+    """
+    b = b or {}
+    only = (b.get("id") or "").strip()
+    timeout = max(5, min(int(b.get("timeout") or 60), 300))
+    with db() as c:
+        proj = c.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
+        if not proj:
+            return None
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM criteria WHERE project_id=? ORDER BY sort_order", (pid,))]
+    cwd = (proj["workdir"] or "").strip() if "workdir" in proj.keys() else ""
+    if cwd and not os.path.isdir(cwd):
+        cwd = ""
+    results = []
+    for r in rows:
+        cmd = (r.get("cmd") or "").strip()
+        if not cmd or (only and r["id"] != only):
+            continue
+        t0 = time.time()
+        try:
+            p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                               timeout=timeout, cwd=(cwd or None))
+            code = int(p.returncode)
+            txt = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
+        except subprocess.TimeoutExpired:
+            code, txt = 124, f"超时（>{timeout}s）"
+        except Exception as e:                       # noqa: BLE001
+            code, txt = 1, f"执行失败：{e}"
+        txt = txt.strip()
+        if len(txt) > 400:
+            txt = txt[-400:]
+        status = "green" if code == 0 else "red"
+        with db() as c:
+            c.execute("UPDATE criteria SET status=?, last_run=?, output=? WHERE id=?",
+                      (status, now_iso(), txt, r["id"]))
+            log_event(c, pid, "criterion.run",
+                      payload=f"{r['id']} → {status}（{int(time.time() - t0)}s）")
+        results.append({"id": r["id"], "status": status, "exit": code,
+                        "sec": round(time.time() - t0, 1),
+                        "output": txt[:120]})
+    return {"ok": True, "ran": len(results), "results": results}
+
+
 def update_criterion(cid, b):
     with db() as c:
         r = c.execute("SELECT * FROM criteria WHERE id=?", (cid,)).fetchone()
@@ -2306,6 +2355,27 @@ def _write_toml(fp, kv):
     os.replace(tmp, fp)
 
 
+def _progress_block(crits, now):
+    """项目头顶那个数字：主线读到第几环 + 多久前读的。
+
+    以前它只藏在 criteria[0].output 里，总监每次都要翻到最后才知道「离通还差多少」。
+    age_sec 一并给出来：读数超过 30 分钟就是过期数据，不能当现状用。
+    """
+    if not crits:
+        return {"mainline": "", "at": "", "age_sec": -1, "stale": True,
+                "green": 0, "total": 0}
+    main = (next((c for c in crits if "主线" in (c.get("text") or "")), None)
+            or next((c for c in crits if (c.get("cmd") or "").strip()), crits[0]))
+    at = main.get("last_run") or ""
+    age = max(0, int(now - _epoch(at))) if at else -1
+    return {"id": main.get("id") or "",
+            "mainline": main.get("output") or "",
+            "at": at, "age_sec": age,
+            "stale": (age < 0 or age > 1800),
+            "green": len([c for c in crits if c.get("status") == "green"]),
+            "total": len([c for c in crits if c.get("status") in ("green", "red")])}
+
+
 def project_state(pid):
     with db() as c:
         p = c.execute("SELECT * FROM projects WHERE id=?", (pid,)).fetchone()
@@ -2810,9 +2880,11 @@ def project_state(pid):
             if not (t.get("dod") or "").strip():
                 viol.append({"code": "no_dod", "sev": "P2", "task": t["title"],
                              "text": "没写验收标准"})
-            if t["status"] in ("review", "done") and t["deliverable_ok"] is False:
+            # done 的交付物在交付那一刻已经验过；事后清理旧包/旧目录不该变成违规。
+            # 只盯「还没收工、却已经找不到产出」的任务。
+            if t["status"] == "review" and t["deliverable_ok"] is False:
                 viol.append({"code": "missing_output", "sev": "P0", "task": t["title"],
-                             "text": "交付物不存在"})
+                             "text": "交付物不存在（还没收工就已经找不到产出）"})
             if (t.get("evidence") == "inferred"
                     and safe_int(t.get("progress"), 0) >= 90):
                 viol.append({"code": "weak_evidence", "sev": "P1", "task": t["title"],
@@ -2882,8 +2954,11 @@ def project_state(pid):
         m["util_pct"] = (min(100, round(100.0 * m["time_total"] / elapsed))
                          if elapsed else 0)
         m["idle_pct"] = max(0, 100 - m["util_pct"])
+        # 「已经交完货下线的人」不是摸鱼：他今晚可能刚交了两轮，只是现在没活干。
+        # 摸鱼只判「在岗却没推进」——离线/僵住的归到「已收工」，交给 idle 去报。
         m["slacking"] = bool(not m.get("is_lead") and elapsed and elapsed > 900
-                             and m["util_pct"] < 20 and m["state"] not in ("working", "stale"))
+                             and m["util_pct"] < 20
+                             and m["state"] in ("working", "idle"))
     team_util = (min(100, round(100.0 * sum(m["time_total"] for m in workers)
                                / (len(workers) * elapsed)))
                  if (workers and elapsed) else 0)
@@ -2967,15 +3042,27 @@ def project_state(pid):
             kind = 2 if t["status"] == "blocked" else (1 if t.get("dep_blocked") else 0)
             return (kind, t["downstream"], now - _epoch(t.get("updated_at") or t["created_at"]))
         b0 = max(cands, key=_rank)
-        kind = ("blocked" if b0["status"] == "blocked"
+        # 「等设备」和「等上游」是两种完全不同的阻塞：
+        # 前者是排队（换个人也动不了），后者是逻辑（上游没做完）。
+        # 混成一个 kind，将来开第二台设备时这条依赖就会变成假阻塞。
+        _res = (b0.get("resource") or "").strip()
+        _holder = None
+        if _res:
+            with db() as _c:
+                _holder = resource_holder(_c, pid, _res, b0["id"])
+        kind = ("resource" if _holder
+                else "blocked" if b0["status"] == "blocked"
                 else "waiting" if b0.get("dep_blocked") else "stalled")
         blocker = {"id": b0["id"], "title": b0["title"], "downstream": b0["downstream"],
                    "kind": kind,
+                   "resource": _res,
+                   "holder": (_holder["title"] if _holder else ""),
                    # 停滞/卡住的时长按「最后一次更新」算，doing_since 会被重开刷新，不可靠
                    "since": int(max(0, now - _epoch(b0.get("updated_at") or b0["created_at"]))),
-                   "reason": b0.get("blocked_reason")
-                             or ("等 " + b0["dep_title"] if b0.get("dep_title") else
-                                 ("已 0 进展" if kind == "stalled" else ""))}
+                   "reason": (f"等设备 {_res}（{_holder['title']} 在占用）" if _holder
+                              else b0.get("blocked_reason")
+                              or ("等 " + b0["dep_title"] if b0.get("dep_title") else
+                                  ("已 0 进展" if kind == "stalled" else "")))}
 
     pending = list_approvals(pid, "pending")
     sreq = list_staff_requests(pid)
@@ -3338,6 +3425,9 @@ def project_state(pid):
             # unknown（还没跑过判定）不进分母：否则「一条都没验」会被读成「全不达标」
             "criteria_total": len([x for x in crits if x["status"] in ("green", "red")]),
             "criteria_all": len(crits), "blocker": blocker,
+            # 一眼就能看见的那个数字：主线读到第几环、多久前读的。
+            # 它以前只藏在 criteria[0].output 里，总监每次都要翻。
+            "progress": _progress_block(crits, now),
             "pending_approvals": pending, "team_cap": TEAM_CAP,
             # 在跑却没落座的子代理：看板不能假装它们不存在，也不能假装它们在编
             "unseated": unseated,
@@ -3382,7 +3472,9 @@ def project_state(pid):
             "estimates_unfilled": estimates_all_one,
             "deliverables_missing": len([t for t in tasks
                                       if t["deliverable_ok"] is False
-                                      and t["status"] in ("review", "done")]),
+                                      # done 之后交付物可能被归档/清理：那不是违规。
+                                      # 交付物在「交付那一刻」存在过，由 done 闸当场验过。
+                                      and t["status"] == "review"]),
             "columns": COLUMNS, "col_label": COL_LABEL,
             "server_time": now_iso()}
 
@@ -5117,6 +5209,10 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             r = upsert_criteria(m.group(1), b)
             return self._send(201, r)
+        m = re.fullmatch(r"/api/projects/([\w]+)/criteria/run", p)
+        if m:
+            r = run_criteria(m.group(1), b)
+            return self._send(200 if r else 404, r or {"error": "no such project"})
         m = re.fullmatch(r"/api/projects/([\w]+)/retros", p)
         if m:
             r = submit_retro(m.group(1), b)

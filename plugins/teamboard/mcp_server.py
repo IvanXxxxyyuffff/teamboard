@@ -278,6 +278,102 @@ def _augment(name, args, text, sc):
     return text, sc
 
 
+_TASK_KEEP = ("id", "title", "status", "priority", "assignee_id", "progress",
+              "eta_left", "depends_on", "resource", "blocked_reason", "checkpoint",
+              "deliverable", "due_at")
+_MEMBER_KEEP = ("id", "name", "seat_no", "role", "state", "turn", "state_source",
+                "load", "capacity", "current_task", "agent_leaf", "model", "effort",
+                "session_silent", "away_for")
+
+
+def compact_state(st):
+    """默认不把整张任务表塞回上下文：一次 project_status 曾经要吃掉 40KB。
+
+    完整列表按需取（full=1）。这里省的不是带宽，是总监的上下文窗口——
+    他每读一次就少一截，读三次就没法干活了。
+    """
+    out = dict(st)
+    tasks = st.get("tasks") or []
+    open_t = [t for t in tasks if t.get("status") not in ("done", "abandoned")]
+    done = [t for t in tasks if t.get("status") == "done"]
+    out["tasks"] = [{k: t.get(k) for k in _TASK_KEEP if k in t} for t in open_t[:20]]
+    out["tasks_done_tail"] = [{"id": t.get("id"), "title": t.get("title")}
+                              for t in done[-3:]]
+    out["task_counts"] = {
+        "total": len(tasks),
+        "open": len(open_t),
+        "done": len(done),
+        "by_status": {s: len([t for t in tasks if t.get("status") == s])
+                      for s in ("backlog", "doing", "review", "blocked", "done")}}
+    out["members"] = []
+    for m in st.get("members") or []:
+        row = {k: m.get(k) for k in _MEMBER_KEEP if k in m}
+        row["doing"] = [t.get("title") for t in (m.get("doing_tasks") or [])][:3]
+        out["members"].append(row)
+    for k in ("roles", "milestones", "hypotheses", "auto_bound",
+              "columns", "col_label", "server_time"):
+        out.pop(k, None)
+    # retro：只要「要不要复盘 + 最近一轮的判定」。题目正文按需 full 取——
+    # 5 道题的题干加起来 7KB，而总监每轮真正要的只是一个布尔值。
+    r = st.get("retro") or {}
+    if r:
+        lt = r.get("latest") or {}
+        out["retro"] = {
+            "required": r.get("required"), "level": r.get("level"),
+            "round": r.get("round"), "reason": (r.get("reason") or "")[:80],
+            "latest": ({k: lt.get(k) for k in
+                        ("id", "status", "round", "trigger", "left_pct", "slip_hours",
+                         "submitted_at", "decided_at")} if lt else None),
+            "history_count": len(r.get("history") or []),
+            "questions_count": len(r.get("questions") or []),
+        }
+    # 编制申请：只留待批的，批过的没有阅读价值
+    out["staff_requests"] = [
+        {"id": s.get("id"), "kind": s.get("kind"),
+         "member": s.get("member_name") or s.get("member_id"),
+         "reason": (s.get("reason") or "")[:60], "status": s.get("status"),
+         "created_at": s.get("created_at")}
+        for s in (st.get("staff_requests") or [])
+        if s.get("status") == "pending"][:6]
+    # align / autopilot / nudge / resume：保留判断所需，砍掉叙述
+    def _seat(x):
+        return {k: x.get(k) for k in ("name", "seat_no", "agent", "silent") if k in x}
+    a = st.get("align") or {}
+    if a:
+        out["align"] = {"ok": a.get("ok"), "checked": a.get("checked"),
+                        "unlogged": [_seat(x) for x in (a.get("unlogged") or [])[:4]],
+                        "nosession": [_seat(x) for x in (a.get("nosession") or [])[:4]],
+                        "ghost": [_seat(x) for x in (a.get("ghost") or [])[:4]]}
+    ap = st.get("autopilot") or {}
+    if ap:
+        out["autopilot"] = {k: ap.get(k) for k in
+                            ("found", "interval_min", "has_board_check", "status", "ready")}
+    nd = st.get("nudge") or {}
+    if nd:
+        n2 = {k: nd.get(k) for k in ("level", "count", "worst_sec", "human", "headline") if k in nd}
+        n2["items"] = [{"kind": it.get("kind"), "who": it.get("who"),
+                        "what": (it.get("what") or "")[:80],
+                        "say": (it.get("say") or "")[:120]}
+                       for it in (nd.get("items") or [])[:4]]
+        out["nudge"] = n2
+    rs = st.get("resume") or {}
+    if rs:
+        r2 = {k: rs.get(k) for k in
+              ("orphans", "not_working", "total", "needs_reconcile", "pending", "human")
+              if k in rs}
+        r2["must"] = (rs.get("must") or "")[:120]
+        r2["ghost"] = [{k: g.get(k) for k in ("name", "seat", "state", "silent")}
+                       for g in (rs.get("ghost") or [])[:4]]
+        out["resume"] = r2
+    crits = []
+    for c in (st.get("criteria") or []):
+        crits.append({"id": c.get("id"), "text": (c.get("text") or "")[:60],
+                      "status": c.get("status"), "last_run": c.get("last_run"),
+                      "output": (c.get("output") or "")[:100]})
+    out["criteria"] = crits
+    return out
+
+
 def summarize(p):
     st = http("GET", "/api/projects/" + p["id"])
     s = st["stats"]
@@ -388,8 +484,20 @@ TOOLS = [
                "openai/ui": {"entrypoints": [{"type": "thread"}, {"type": "global"}]}}},
     {"name": "project_status", "description": "查看某个项目的详细状态：成员在做什么、任务分布、阻塞项",
      "inputSchema": {"type": "object", "properties": {
-         "project": {"type": "string", "description": "项目名或 id，留空取最近一个"}},
+         "project": {"type": "string", "description": "项目名或 id，留空取最近一个"},
+         "full": {"type": "boolean", "description": "默认只回未关任务+最近3条完成（省上下文）；要全部历史任务才传 true"}},
      "_meta": {"ui": {"resourceUri": UI_URI}}}},
+    {"name": "update_project", "description": "改项目级字段（目标文字 / 验收标准 / 截止时间 / 名称）。目标数字过时了就用这个改，不要让它一直挂着旧数字",
+     "inputSchema": {"type": "object", "properties": {
+         "project": {"type": "string", "description": "项目名或 id"},
+         "name": {"type": "string"}, "goal": {"type": "string"},
+         "goal_criteria": {"type": "string", "description": "验收标准（怎样算达成）"},
+         "deadline": {"type": "string", "description": "截止时间，如 2026-10-30 18:00"}}}},
+    {"name": "run_criteria", "description": "真跑验收命令并按退出码回写红绿（0=绿）。返回每条 id/状态/耗时/回显摘要；不带 id 就跑全部带 cmd 的条目",
+     "inputSchema": {"type": "object", "properties": {
+         "project": {"type": "string", "description": "项目名或 id"},
+         "id": {"type": "string", "description": "只跑某条验收（如 c_main），留空跑全部"},
+         "timeout": {"type": "integer", "description": "单条超时秒数，默认 60，上限 300"}}}},
     {"name": "resume_brief", "description": "交班简报：新会话/重启 Codex 之后必须先调这一个。回答「谁断了、断了多久、哪条 doing 任务烂尾、先处置什么」。不调就派活，会对着已经停掉的子代理空等",
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "string", "description": "项目名或 id，留空取最近一个"}}}},
@@ -639,6 +747,8 @@ def call(name, args):
         p = pick_project(args.get("project", ""))
         touch_lead(p["id"])
         text, st = summarize(p)
+        if not args.get("full"):
+            st = compact_state(st)
         return text, st
 
     if name == "resume_brief":
@@ -1100,6 +1210,42 @@ def call(name, args):
             extra.append("资源冲突 ⚠")
         return (f"{t['title']} → {t['status']} {t['progress']}%"
                 + ("　" + " · ".join(extra) if extra else "")), t
+
+    if name == "run_criteria":
+        p = pick_project(args.get("project", ""))
+        body = {}
+        if args.get("id"):
+            body["id"] = args["id"]
+        if args.get("timeout"):
+            body["timeout"] = args["timeout"]
+        r = http("POST", f"/api/projects/{p['id']}/criteria/run", body)
+        if not isinstance(r, dict) or r.get("error"):
+            raise RuntimeError(str((r or {}).get("error") or "验收没跑起来"))
+        res = r.get("results") or []
+        lines = [f"跑了 {r.get('ran', 0)} 条验收（{p['name']}）："]
+        for x in res:
+            head = "🟢 " if x.get("status") == "green" else "🔴 "
+            lines.append(f"{head}{x.get('id')}　{x.get('sec')}s　exit={x.get('exit')}"
+                         + (f"　{(x.get('output') or '')[:80]}" if x.get("output") else ""))
+        if not res:
+            lines.append("没有可跑的条目：每条验收要带 cmd（可执行命令）才会跑。")
+        # 只回摘要，别把 400 字回显原样塞进上下文
+        slim = {"ran": r.get("ran", 0),
+                "results": [{k: (x.get(k) or "")[:120] if k == "output" else x.get(k)
+                             for k in ("id", "status", "exit", "sec", "output")} for x in res]}
+        return "\n".join(lines), slim
+
+    if name == "update_project":
+        p = pick_project(args.get("project", ""))
+        body = {k: args[k] for k in ("name", "goal", "goal_criteria", "deadline") if args.get(k)}
+        if not body:
+            raise RuntimeError("没有要改的字段（name / goal / goal_criteria / deadline）")
+        r = http("PATCH", f"/api/projects/{p['id']}", body)
+        if not isinstance(r, dict) or r.get("error"):
+            return f"没改成：{(r or {}).get('error') or r}", r if isinstance(r, dict) else {}
+        used = "、".join(body)
+        echo = {k: (str(v)[:60]) for k, v in body.items()}
+        return f"已更新 {p['id']}：{used}", {"ok": True, "changed": echo}
 
     raise RuntimeError(f"未知工具：{name}")
 

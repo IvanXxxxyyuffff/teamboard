@@ -3,7 +3,7 @@
 
 This is the "git clone && it works" test. It starts nothing but mcp_server.py.
 """
-import json, pathlib, subprocess, sys, threading, time
+import json, os, pathlib, subprocess, sys, threading, time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _util import PLUGIN, PYTHON, free_port, temp_home, env_for, kill_board, call, wait_health
 
@@ -66,8 +66,30 @@ def main():
         r = m.rpc("tools/list")
         tools = [t["name"] for t in r.get("result", {}).get("tools", [])]
         check("tools/list exposes >=20 tools", len(tools) >= 20, len(tools))
-        for name in ("board_overview", "project_status", "propose_plan", "tb_api", "update_task"):
+        for name in ("board_overview", "project_status", "propose_plan", "tb_api", "update_task",
+                     "update_project", "run_criteria"):
             check(f"tool present: {name}", name in tools)
+
+        # 省上下文是硬指标：默认返回里不能带全量历史任务
+        st = {"tasks": [{"id": f"t{i}", "title": "x" * 40, "status": "done"} for i in range(30)]
+              + [{"id": "open1", "title": "open", "status": "doing"}],
+              "members": [], "retro": {"questions": [{"q": "x" * 400}] * 5,
+                                       "history": [{"id": str(i)} for i in range(20)]},
+              "nudge": {"items": [{"say": "y" * 600}] * 4}}
+        # 同一份代码，按文件加载：模块顶层 BASE=_boot() 会去探测已在跑的看板（上面刚起）
+        os.environ["TEAMBOARD_URL"] = base        # 明确指向测试板，禁止它自己去起一个
+        sys.path.insert(0, str(PLUGIN))
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("tb_mcp_test", PLUGIN / "mcp_server.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        compact = mod.compact_state(st)
+        check("compact: no done-task dump", len(compact["tasks"]) == 1, len(compact["tasks"]))
+        check("compact: retro questions dropped",
+              len(json.dumps(compact.get("retro"), ensure_ascii=False)) < 800, compact.get("retro"))
+        check("compact: nudge say truncated",
+              all(len(x["say"]) <= 130 for x in compact["nudge"]["items"]),
+              compact["nudge"]["items"][:1])
 
         r = m.rpc("resources/list")
         res = r.get("result", {}).get("resources", [])

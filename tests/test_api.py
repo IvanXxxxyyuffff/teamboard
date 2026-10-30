@@ -546,6 +546,22 @@ def main():
         check("a task cannot be created already-done",
               code >= 400 and "已完成" in json.dumps(done_direct, ensure_ascii=False),
               done_direct)
+
+        # 目标文字必须能改：改不了，看板顶部就会一直挂着几小时前的旧数字
+        code, patched = call(base, "PATCH", f"/api/projects/{pid}",
+                             {"goal": "ship v2", "goal_criteria": "green + smoke"})
+        check("project goal is editable",
+              code == 200 and (patched.get("project") or {}).get("goal") == "ship v2", patched)
+
+        # 验收命令真跑：0 = 绿，非 0 = 红（读数由此带上时间，不再是自评）
+        code, crit = call(base, "POST", f"/api/projects/{pid}/criteria",
+                          {"items": [{"id": "c_ok", "text": "真命令", "cmd": "true"},
+                                     {"id": "c_bad", "text": "必失败", "cmd": "false"}]})
+        check("criteria with cmd accepted", code in (200, 201), crit)
+        code, ran = call(base, "POST", f"/api/projects/{pid}/criteria/run", {})
+        by = {x["id"]: x for x in (ran.get("results") or [])}
+        check("run_criteria: exit 0 → green", by.get("c_ok", {}).get("status") == "green", ran)
+        check("run_criteria: exit 1 → red", by.get("c_bad", {}).get("status") == "red", ran)
     finally:
         kill_board(base)
         try:

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.24 — context budget is part of the interface
+
+Eight items of field feedback from a 10-hour run. The one that costs the most is not a bug:
+`project_status` returned every finished task, ~40 KB per call, and the lead reads it every turn.
+Default is now compact — open tasks (≤20, whitelisted fields) + last 3 finished + counts; `full=true`
+keeps the old payload. Measured on the reference project: 41 KB → 6 KB.
+
+- `done` tasks no longer trip `missing_output` / `deliverables_missing`. Deleting an old APK after
+  delivery is cleanup, not a violation; the check now only applies to `review` tasks.
+- `PATCH /api/projects/<id>` gets an MCP front door (`update_project`) so a stale goal line can be
+  rewritten from the session instead of returning `no route`.
+- `POST /api/projects/<id>/criteria/run` + `run_criteria` tool: actually executes each criterion's
+  `cmd` and writes red/green back (exit 0 = green, timeout 60 s = red). A reading is now stamped with
+  the time it was taken, so "16/163" can't sit there for hours while the project is at 32/163.
+- `slackers` only counts `working`/`idle` seats; someone who delivered and logged off is not a slacker.
+- `blocker.kind` separates `resource` (device held by someone else) from `depends_on`, so a single
+  emulator doesn't masquerade as a logical dependency.
+- Top-level `progress` block: mainline reading, age, `stale` flag — the number you actually ask for
+  no longer hides inside `criteria[0].output`.
+
 ## 0.3.23 — mid-turn commentary is not a turn ending
 
 A `message` event is written whenever the agent says something inside a turn ("Now the patch:").
