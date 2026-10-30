@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.21 — an open thread is not a running turn
+
+Codex's subagent list counts *threads that are still open*. The board counts *turns that are
+still running*. After a subagent finishes its turn the thread stays open, so the two lists
+disagree for minutes and the board looks broken ("it says nobody is working, but I can see one").
+
+**The badge says which it is.** A seat whose transcript ended with `task_complete` now reads
+`僵住·回合已结束` / `摸鱼中·回合已结束`, and a seat with no session at all reads `·无会话`. No more
+guessing whether "not working" means "finished" or "never started".
+
+**A pending tool call counts as working.** When the last event is a `function_call` with no
+`function_call_output` yet — a long `adb` loop, a full regression run — the seat is treated as
+running for up to 30 minutes even though the transcript has not been written to. Silence is only
+evidence of idleness when nothing is in flight.
+
 ## 0.3.20 — a button that does something
 
 Two chips on the nudge and align banners ("现在该做" / "怎么修") looked like buttons and were

@@ -971,13 +971,17 @@ function acceptChip(){
 const STATE_LABEL={idle:"摸鱼中",working:"工作中",stale:"僵住",blocked:"卡住·摸鱼中",offline:"摸鱼中"};
 // 状态来源：同样是「工作中」，会话在写和任务挂着是两回事，看板不能把它们画成一个样子
 const SRC_TAG={session:"会话",task:"任务","task+stale":"任务未回收"};
+// Codex 的「子智能体」列表数的是「会话还开着」，看板数的是「这一轮还在跑」
+const TURN_TAG={ended:"回合已结束",vacant:"无会话"};
 function stateText(m){
   const base=STATE_LABEL[m.state]||m.state;
   // 人还在干活、只是手上有条卡住的任务：徽章就说「工作中」，
   // 卡点单独一行红字写清楚，别把两件事挤进一个徽章里
   if(m.state_source==="session+blocked") return base;
   const tag=SRC_TAG[m.state_source]||"";
-  return (m.state==="working"||m.state==="stale")&&tag?`${base}(${tag})`:base;
+  const core=(m.state==="working"||m.state==="stale")&&tag?`${base}(${tag})`:base;
+  const tt=TURN_TAG[m.turn]||"";
+  return (tt&&m.state!=="working")?`${core}·${tt}`:core;
 }
 
 // 阻塞不是摸鱼：状态仍是两态，但把「卡住」单拎出来，否则看板会把真卡点藏进摸鱼队列

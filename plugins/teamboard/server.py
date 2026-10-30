@@ -1575,7 +1575,8 @@ def session_digest(path, head_chars=240):
     hit = _DIGEST_CACHE.get(path)
     if hit and hit[0] == key:
         return hit[1]
-    info = {"last_message": "", "last_tools": [], "last_at": ""}
+    info = {"last_message": "", "last_tools": [], "last_at": "",
+            "last_type": "", "last_tool": ""}
     try:
         with open(path, "rb") as f:
             f.seek(max(0, st.st_size - 60000))
@@ -1603,11 +1604,17 @@ def session_digest(path, head_chars=240):
                 nm = pl.get("name") or ""
                 if nm:
                     tools.append(nm)
+            if not info["last_type"]:
+                # 最新一笔是什么：function_call 说明工具还没回来（这一轮正在跑）
+                info["last_type"] = t
+                if t == "function_call":
+                    info["last_tool"] = pl.get("name") or ""
             if info["last_message"] and len(tools) >= 4:
                 break
         info["last_tools"] = list(reversed(tools))
     except OSError:
-        info = {"last_message": "", "last_tools": [], "last_at": ""}
+        info = {"last_message": "", "last_tools": [], "last_at": "",
+                "last_type": "", "last_tool": ""}
     _DIGEST_CACHE[path] = (key, info)
     return info
 
@@ -2427,6 +2434,16 @@ def project_state(pid):
                 # 重启/压缩/建会话这类「非工作事件」落在尾部：文件是新的，人没在跑
                 m["session_idle_tail"] = ttype
                 m["session_live"] = False
+        # 工具还没回来 = 这一轮正在跑。子代理等一条长命令（adb 循环、全量回归）时会话
+        # 可以几分钟不写一笔，只按「最后写入时间」判，会把正在干活的人画成摸鱼。
+        if (_dg.get("last_type") == "function_call" and not m["session_live"]
+                and _dg.get("last_at")):
+            _age = max(0, int(now - _ts_epoch(_dg.get("last_at") or "")))
+            if _age < 1800:
+                m["session_live"] = True
+                m["session_ended"] = ""
+                m["tool_running"] = _dg.get("last_tool") or ""
+                m["state_source"] = "tool"
         # 宿主进程探活：Codex 一退出，子代理就再也不会有任何回调，
         # 只靠心跳/会话窗口会让看板继续显示「工作中」5~15 分钟。
         # 登记过 pid 的成员，进程没了就当场判死，不等窗口过期。
@@ -2532,6 +2549,13 @@ def project_state(pid):
         else:
             m["dead_reason"] = ""
         m["working"] = m["state"] == "working"
+        # 回合状态：Codex 的「子智能体」列表统计的是「会话还开着」，
+        # 看板统计的是「这一轮还在跑」。两者不是一回事，必须各自说清楚，
+        # 否则用户看到 UI 里有 3 个、看板写 0 个，只会以为看板坏了。
+        m["turn"] = ("running" if m["session_live"] else
+                     "ended" if m.get("session_ended") else
+                     "idle" if m.get("session_awaiting") else
+                     "vacant" if not sess_mt_full else "silent")
         m["stalled"] = m["state"] == "stale"           # 任务挂着、人不在：要单独喊出来
         m["online"] = m["state"] != "offline"          # 在岗 = 不是离线
         m["stale"] = bool(doing) and not m["live"]      # 在干活但没心跳上报
