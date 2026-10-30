@@ -1467,6 +1467,10 @@ def decide_retro(rid, b):
 
 # 会话目录可覆盖：测试要造一条「正在写」的会话，不该往用户真实目录里扔文件
 SESS_ROOT = os.environ.get("TEAMBOARD_SESSIONS") or os.path.expanduser("~/.codex/sessions")
+# 「归档」≠「没人用」：followup_task / 复用旧会话时，rollout 会被移到 archived_sessions
+# 却继续被写入。只扫 sessions/ 的后果是——一个真在干活的子代理在看板上变成「无会话」。
+SESS_ARCHIVE = os.environ.get("TEAMBOARD_ARCHIVE") or os.path.expanduser(
+    "~/.codex/archived_sessions")
 _THREAD_CACHE = {"at": 0.0, "rows": []}
 _LIVE_CACHE = {"at": 0.0, "map": {}, "sig": None}
 SESSION_LIVE_WINDOW = HEARTBEAT_WINDOW   # 与会话/心跳同一个窗口，别让两个时钟互相打架
@@ -1664,13 +1668,54 @@ def session_path_of(tid):
     p = (_LIVE_CACHE.get("paths") or {}).get(tid)
     if p and os.path.exists(p):
         return p
-    hits = glob.glob(os.path.join(SESS_ROOT, "*", "*", "*", f"*-{tid}.jsonl"))
+    hits = (glob.glob(os.path.join(SESS_ROOT, "*", "*", "*", f"*-{tid}.jsonl"))
+            + glob.glob(os.path.join(SESS_ARCHIVE, f"*-{tid}.jsonl")))
     if not hits:
         return ""
     try:
         return max(hits, key=os.path.getmtime)
     except OSError:
         return hits[0]
+
+
+_AGENT_SESS = {}
+
+
+def find_agent_session(leaf, days=2, fresh=3600):
+    """按 agent_path 找这个工位最近的会话。
+
+    为什么需要：`thread_id` 会被清空（会话结束）、会话会被挪进 archived_sessions
+    （followup_task 复用旧会话），两种情况下「谁在干活」都还写在 rollout 的
+    session_meta 里——`"agent_path":"/root/<leaf>"`。这是唯一不依赖台账的锚点。
+    """
+    leaf = (leaf or "").strip()
+    if not leaf:
+        return ""
+    now = time.time()
+    hit = _AGENT_SESS.get(leaf)
+    if hit and now - hit[0] < 20:
+        return hit[1]
+    best, best_mt = "", 0.0
+    today0 = datetime.now()
+    dirs = [os.path.join(SESS_ROOT, f"{(today0 - timedelta(days=i)):%Y}",
+                         f"{(today0 - timedelta(days=i)):%m}",
+                         f"{(today0 - timedelta(days=i)):%d}") for i in range(days)]
+    for d in dirs + [SESS_ARCHIVE]:
+        for p in glob.glob(os.path.join(d, "*.jsonl")):
+            try:
+                mt = os.path.getmtime(p)
+            except OSError:
+                continue
+            if now - mt > fresh:
+                continue
+            try:
+                head = open(p, "rb").read(4096).decode("utf-8", "ignore").replace(" ", "")
+            except OSError:
+                continue
+            if f'"agent_path":"/root/{leaf}"' in head and mt > best_mt:
+                best, best_mt = p, mt
+    _AGENT_SESS[leaf] = (now, best)
+    return best
 
 
 def session_mtimes(ttl=2, days=10):
@@ -1690,19 +1735,23 @@ def session_mtimes(ttl=2, days=10):
     dirs = [os.path.join(SESS_ROOT, f"{(today0 - timedelta(days=i)):%Y}",
                          f"{(today0 - timedelta(days=i)):%m}",
                          f"{(today0 - timedelta(days=i)):%d}") for i in range(days)]
+    # 归档目录只取最近几天有写入的，避免每次轮询 stat 几千个历史文件
+    dirs_all = dirs + [SESS_ARCHIVE]
     try:
-        sig = tuple(os.path.getmtime(d) if os.path.isdir(d) else 0.0 for d in dirs)
+        sig = tuple(os.path.getmtime(d) if os.path.isdir(d) else 0.0 for d in dirs_all)
     except OSError:
         sig = None
     if now - _LIVE_CACHE["at"] < ttl and _LIVE_CACHE.get("sig") == sig:
         return _LIVE_CACHE["map"]
     out = {}
     paths = {}
-    for d in dirs:
+    for d in dirs_all:
         for p in glob.glob(os.path.join(d, "*.jsonl")):
             try:
                 mt = os.path.getmtime(p)
             except OSError:
+                continue
+            if d == SESS_ARCHIVE and (now - mt) > days * 86400:
                 continue
             m = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
                           r"[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$", p)
@@ -2403,6 +2452,20 @@ def project_state(pid):
         m["agent_nickname"] = ap.get("agent_nickname") or ""
         m["agent_leaf"] = (m["agent_path"].rstrip("/").split("/")[-1]
                            if m["agent_path"] else "")
+        # thread_id 丢了（会话被关 / 被归档）也还有救：按 agent_path 把最近的会话找回来。
+        # 找不到才是真的没绑；找到就当场回绑（下面统一写库 + 落事件，可审计）。
+        if not tid0:
+            _leaf = m["agent_leaf"] or (m.get("name") or "").strip().split(" ")[-1]
+            _p = find_agent_session(_leaf)
+            if _p:
+                _mm = re.search(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                                r"[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$", _p)
+                if _mm:
+                    m["rebind_to"] = _mm.group(1)
+                    try:
+                        m["rebind_age"] = max(0, int(now - os.path.getmtime(_p)))
+                    except OSError:
+                        m["rebind_age"] = -1
         # 他最后说的那句话 / 最后在跑什么：接手僵住工位的第一手材料，
         # 比「没有断点记录，先查产物和日志」有用得多。
         _dg = session_digest((_LIVE_CACHE.get("paths") or {}).get(tid0, "")) if tid0 else {}
@@ -2521,7 +2584,8 @@ def project_state(pid):
         elif blocked_dead:
             m["state"] = "stale"
             m["state_source"] = "task+stale"
-        elif doing and not host_dead and (m["session_live"] or (beat > 0 and (now - beat) < DOING_STALE_SEC)):
+        elif (doing and not host_dead and not m.get("session_ended")
+              and (m["session_live"] or (beat > 0 and (now - beat) < DOING_STALE_SEC))):
             m["state"] = "working"
             m["state_source"] = "session" if m["session_live"] else "task"
         elif doing:
@@ -2555,7 +2619,8 @@ def project_state(pid):
         m["turn"] = ("running" if m["session_live"] else
                      "ended" if m.get("session_ended") else
                      "idle" if m.get("session_awaiting") else
-                     "vacant" if not sess_mt_full else "silent")
+                     "vacant" if not m["thread_id"] else
+                     "unknown" if not sess_mt_full else "silent")
         m["stalled"] = m["state"] == "stale"           # 任务挂着、人不在：要单独喊出来
         m["online"] = m["state"] != "offline"          # 在岗 = 不是离线
         m["stale"] = bool(doing) and not m["live"]      # 在干活但没心跳上报
@@ -2581,6 +2646,23 @@ def project_state(pid):
     if alive_upd:
         with db() as c:
             c.executemany("UPDATE members SET last_alive=? WHERE id=?", alive_upd)
+
+    # 自动回绑：thread_id 丢了、但 agent_path 还能在会话文件里认出来 → 接回原工位。
+    # 语义是「换会话，不换人」：工位号/姓名/历史都不动，只把执行体接回来。
+    # 只认 10 分钟内还有写入的会话，避免把一条死会话绑到一个活工位上。
+    for m in members:
+        _rb = (m.get("rebind_to") or "").strip()
+        if not _rb or m.get("is_lead"):
+            continue
+        if int(m.get("rebind_age") or 999999) > 600:
+            continue
+        try:
+            bind_member(pid, m["id"], _rb,
+                        reason="auto: agent_path 回绑（会话被关闭或归档后自动接回）")
+            m["thread_id"] = _rb
+            m["rebind_auto"] = True
+        except Exception:
+            pass
 
     # 会话接管台账：证明「关掉子代理又开一个」是同一把椅子换人，不是新员工
     with db() as c:
@@ -3098,8 +3180,19 @@ def project_state(pid):
                0, x.get("task_id", ""), x.get("id", ""))
     # 空椅子：既没有会话，也没有任务。它占着编制却不产出，是「4 个人 3 个摸鱼」里
     # 最隐蔽的一种——另外两种至少还能看见人在不在，这种连会话都没有。
+    # 待回绑：会话找得到、只是没绑在工位上——和「空椅子」是两件事。
+    # 报错要能直接复制一条 bind_member，别让人自己拼 UUID。
     for m in workers:
-        if (m.get("thread_id") or "").strip():
+        rb = (m.get("rebind_to") or "").strip()
+        if not rb or m.get("rebind_auto"):
+            continue
+        _nitem("rebind", m.get("name") or "?",
+               f"会话没绑在工位上，但它在跑（agent_path 匹配到 {rb[:8]}…，"
+               f"{m.get('rebind_age') if m.get('rebind_age', -1) >= 0 else '?'} 秒前还写过）",
+               f"bind_member(member_id='{m.get('id','')}', thread_id='{rb}')",
+               0, "", m.get("id", ""))
+    for m in workers:
+        if (m.get("thread_id") or "").strip() or (m.get("rebind_to") or "").strip():
             continue
         # 名下有 backlog 不算「有人在干」：椅子还是空的，只是活先堆在上面了。
         if any(t.get("assignee_id") == m["id"] and t["status"] in REGISTERED

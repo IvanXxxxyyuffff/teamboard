@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.22 — archived is not dead
+
+A subagent can be running inside a rollout that lives in `~/.codex/archived_sessions/`:
+`followup_task` reuses the old thread, the file keeps being written, and a board that only indexes
+`~/.codex/sessions/` sees nothing. One seat was reported as "no session / 摸鱼" while its transcript
+was being appended to seven minutes earlier.
+
+**The archive is indexed.** Both roots are scanned (archive limited to the last ten days of writes),
+and `session_path_of` falls back to it, so tail/digest/handover all work for a reopened thread.
+
+**Binding is recovered, not asked for.** When `thread_id` is empty, the seat's `agent_path`
+(`/root/<leaf>`) is matched against the last hour of rollouts; a match younger than ten minutes is
+bound immediately with a `member.thread_rebind` event. A match that is older, or an agent with no
+session at all, becomes a `rebind` nudge carrying the exact `bind_member(...)` command — instead of
+being reported as an empty chair.
+
+**A finished turn is not a working seat.** `task_complete` now wins over a stale heartbeat: a seat
+whose turn ended ten minutes ago can no longer be drawn as `工作中` just because something beat on
+its behalf.
+
 ## 0.3.21 — an open thread is not a running turn
 
 Codex's subagent list counts *threads that are still open*. The board counts *turns that are
