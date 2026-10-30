@@ -75,6 +75,9 @@ def main():
         check("approved hire lands with confirmed model+effort",
               code in (200, 201) and mem2.get("id") and mem2.get("model") == "gpt-test-large",
               decided)
+        # 决定之后必须回执，否则后面的状态迁移全被 ack_gate 拦（这正是要的行为）
+        call(base, "POST", f"/api/projects/{pid}/ack",
+             {"kind": "staff", "id": req["id"], "note": "收到，继续"})
 
         code, mem3 = call(base, "POST", f"/api/projects/{pid}/members",
                           {"name": "未确认", "role": "测试", "model": "gpt-test-large", "effort": "high"})
@@ -351,6 +354,8 @@ def main():
                           {"decision": "approve"})
         check("alignment fixture: second seat lands through approval",
               code in (200, 201) and (dec2.get("member") or {}).get("id"), dec2)
+        call(base, "POST", f"/api/projects/{pid2}/ack",
+             {"kind": "staff", "id": sreq2["id"], "note": "收到，继续"})
 
         # 一条 backlog：有活可派，但没人挂上去
         code, t2 = call(base, "POST", f"/api/projects/{pid2}/tasks",
@@ -393,6 +398,41 @@ def main():
         check("registering the task clears the alignment gate",
               (st4.get("align") or {}).get("ok") is True,
               {k: st4.get("align", {}).get(k) for k in ("unlogged", "ghost", "nosession")})
+
+        # 回执闸：用户点了批准，总监必须回一句「收到」。不回执就改状态/提计划/导报告，
+        # 决定永远停在库里——下一轮照旧按旧编制跑，而用户以为已经生效。
+        _, p3 = call(base, "POST", "/api/projects",
+                     {"name": "ack", "deadline": "2030-01-01 18:00",
+                      "goal": "g", "goal_criteria": "c"})
+        pid3 = p3["project"]["id"]
+        code, w3 = call(base, "POST", f"/api/projects/{pid3}/members",
+                        {"name": "工程丙", "role": "后端工程", "model": "gpt-test-large",
+                         "effort": "high", "model_confirmed": True})
+        code, t3 = call(base, "POST", f"/api/projects/{pid3}/tasks",
+                        {"title": "回执测试任务", "assignee": w3["id"], "estimate": 1,
+                         "milestone": "M1", "deliverable": str(doc), "dod": "x"})
+        code, sr3 = call(base, "POST", f"/api/projects/{pid3}/staff-requests",
+                         {"kind": "add", "name": "验收丁", "role": "验收",
+                          "reason": "回执测试"})
+        code, dec3 = call(base, "POST", f"/api/staff-requests/{sr3['id']}/decide",
+                          {"decision": "approve"})
+        check("ack fixture: a decision lands", code in (200, 201), dec3)
+        code, st5 = call(base, "GET", f"/api/projects/{pid3}")
+        need = st5.get("need_ack") or []
+        check("a decision without a receipt shows up as need_ack",
+              len(need) == 1 and need[0]["kind"] == "staff" and need[0]["id"] == sr3["id"], need)
+        code, blocked_r = call(base, "PATCH", f"/api/tasks/{t3['id']}", {"status": "doing"})
+        check("status changes are refused until the director acknowledges",
+              code in (400, 403) and blocked_r.get("need_ack"), blocked_r)
+        code, acked = call(base, "POST", f"/api/projects/{pid3}/ack",
+                           {"kind": "staff", "id": sr3["id"], "note": "收到，下一步派活"})
+        check("ack clears the receipt and returns the remaining count",
+              code == 200 and acked.get("need_ack_left") == 0, acked)
+        code, freed3 = call(base, "PATCH", f"/api/tasks/{t3['id']}", {"status": "doing"})
+        check("after the ack the gate opens", code == 200, freed3)
+        code, st6 = call(base, "GET", f"/api/projects/{pid3}")
+        check("an acknowledged decision is not re-counted",
+              not (st6.get("need_ack") or []), st6.get("need_ack"))
     finally:
         kill_board(base)
         try:

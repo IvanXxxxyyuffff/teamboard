@@ -269,6 +269,8 @@ def init_db():
             created_at TEXT NOT NULL, decided_at TEXT DEFAULT '');
         """)
         # 轻量迁移：老库补列
+        _ack_before = {t: ("ack_at" in {r["name"] for r in c.execute(f"PRAGMA table_info({t})")})
+                       for t in ("approvals", "retros")}
         for tbl, col, ddl in [
             ("projects", "deadline", "TEXT DEFAULT ''"),
             ("members", "capacity", "INTEGER DEFAULT 3"),
@@ -323,10 +325,20 @@ def init_db():
             # last_seen 会被派活/改状态一起刷新，不能当「在干活」的证据。
             # beat_at 只由真正的 /heartbeat 写，是工位自己在说「我还活着」。
             ("members", "beat_at", "REAL DEFAULT 0"),
+            # 审批回执：用户点了批准/驳回之后，总监必须在会话里回一句「收到」。
+            # ack_at=0 且已决定 = 欠一条回执，写操作会被 ack_gate 拦住。
+            # 为什么用独立列而不是「复用 decided_at」：决定是用户做的，回执是总监做的，
+            # 两件事必须能分别追责——否则「谁没回话」永远查不出来。
+            ("approvals", "ack_at", "REAL DEFAULT 0"),
+            ("retros", "ack_at", "REAL DEFAULT 0"),
         ]:
             have = {r["name"] for r in c.execute(f"PRAGMA table_info({tbl})")}
             if col not in have:
                 c.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ddl}")
+        # 老库刚补上 ack_at：已决定的历史单子一律视为已回执，不追着要「收到」
+        for _t, _had in _ack_before.items():
+            if not _had:
+                c.execute(f"UPDATE {_t} SET ack_at=1 WHERE status NOT IN ('pending','submitted')")
         # 编制台账：工位 ↔ 会话的绑定历史。子代理被关掉重开，台账能证明是同一把椅子。
         c.executescript("""
         CREATE TABLE IF NOT EXISTS member_threads(
@@ -367,6 +379,10 @@ def init_db():
             c.execute("ALTER TABLE staff_requests ADD COLUMN consumed_at REAL DEFAULT 0")
         if "decided_by" not in have:
             c.execute("ALTER TABLE staff_requests ADD COLUMN decided_by TEXT DEFAULT ''")
+        if "ack_at" not in have:
+            c.execute("ALTER TABLE staff_requests ADD COLUMN ack_at REAL DEFAULT 0")
+            # 老单子是历史，不追着要回执；只有本次之后做的决定才要「收到」
+            c.execute("UPDATE staff_requests SET ack_at=1 WHERE status<>'pending'")
         # 迁移：老项目没有「承诺登记时刻」，用建项时刻兜底，行为与改动前一致
         for r in c.execute("SELECT id, created_at FROM projects"
                            " WHERE committed_at IS NULL OR committed_at=0").fetchall():
@@ -810,6 +826,10 @@ def create_approval(pid, b):
     gate = retro_gate(pid)
     if gate:
         return gate
+    # 用户刚拍过板的那一条还没回执，就先别提新计划：这一轮的起点是「收到」。
+    gate = ack_gate(pid)
+    if gate:
+        return gate
     # 全员停摆时不许提新计划：新计划 = 把人重新铺一遍，可一个人都没在跑，
     # 铺出来的只会是又一份躺在数据库里的清单。
     gate = idle_gate(pid)
@@ -996,6 +1016,90 @@ def decide_approval(aid, b):
     out = get_approval(aid)
     out["apply_errors"] = errors
     return out
+
+
+ACK_TABLES = {"plan": "approvals", "retro": "retros", "staff": "staff_requests"}
+ACK_LABEL = {"plan": "计划审批", "retro": "强制复盘", "staff": "编制变更"}
+
+
+def list_need_ack(pid):
+    """用户已经拍过板、总监还没回「收到」的单子。
+
+    为什么要成一等公民：用户点了批准，总监那一轮可能已经结束了。下一条消息
+    如果不强制回执，它就当没发生——继续按旧编制、旧计划往下干，而用户以为
+    已经生效。所以「决定」和「回执」必须分开记，欠回执要拦写操作。
+    """
+    out = []
+    with db() as c:
+        for r in c.execute("SELECT id,status,decided_at,summary FROM approvals"
+                           " WHERE project_id=? AND status<>'pending'"
+                           " AND COALESCE(ack_at,0)=0 ORDER BY decided_at DESC LIMIT 20", (pid,)):
+            out.append({"kind": "plan", "id": r["id"], "label": ACK_LABEL["plan"],
+                        "status": r["status"],
+                        "decision_cn": "已批准" if r["status"] == "approved" else "已驳回",
+                        "title": (r["summary"] or "").strip() or "计划审批",
+                        "decided_at": r["decided_at"] or ""})
+        for r in c.execute("SELECT id,status,decided_at,round FROM retros"
+                           " WHERE project_id=? AND status IN ('approved','rejected')"
+                           " AND COALESCE(ack_at,0)=0 ORDER BY decided_at DESC LIMIT 20", (pid,)):
+            out.append({"kind": "retro", "id": r["id"], "label": ACK_LABEL["retro"],
+                        "status": r["status"],
+                        "decision_cn": "已批准" if r["status"] == "approved" else "已驳回",
+                        "title": f"第 {int(r['round'] or 1)} 轮复盘",
+                        "decided_at": now_iso()})
+        for r in c.execute("SELECT id,kind,status,decided_at,payload,reason FROM staff_requests"
+                           " WHERE project_id=? AND status<>'pending'"
+                           " AND COALESCE(ack_at,0)=0 ORDER BY decided_at DESC LIMIT 20", (pid,)):
+            try:
+                pl = json.loads(r["payload"] or "{}")
+            except Exception:                       # noqa: BLE001
+                pl = {}
+            who = pl.get("name") or ""
+            out.append({"kind": "staff", "id": r["id"], "label": ACK_LABEL["staff"],
+                        "status": r["status"],
+                        "decision_cn": "已批准" if r["status"] == "approved" else "已驳回",
+                        "title": f"{ {'add': '加人', 'replace': '换人', 'remove': '撤编'}.get(r['kind'], r['kind']) }"
+                                 f"{('：' + who) if who else ''}"
+                                 f"{('（' + (r['reason'] or '')[:24] + '）') if r['reason'] else ''}",
+                        "decided_at": now_iso()})
+    return out
+
+
+def ack_decision(pid, kind, rid, note="", by=""):
+    """总监对用户的决定回一句「收到」。没有这一步，决定只落在库里，没进他的脑子。"""
+    tbl = ACK_TABLES.get(kind)
+    if not tbl:
+        return {"error": "kind 只能是 plan / retro / staff"}
+    with db() as c:
+        r = c.execute(f"SELECT * FROM {tbl} WHERE id=? AND project_id=?", (rid, pid)).fetchone()
+        if not r:
+            return {"error": f"没有这张{ACK_LABEL[kind]}单：{rid}"}
+        if r["status"] in ("pending", "submitted"):
+            return {"error": f"这张{ACK_LABEL[kind]}还没被用户决定（{r['status']}），不用回执"}
+        c.execute(f"UPDATE {tbl} SET ack_at=? WHERE id=?", (time.time(), rid))
+        log_event(c, pid, "approval.acked", actor=by or "",
+                  payload=f"{kind} {rid} {r['status']} {note}"[:500])
+    # 出事务再数：在同一个连接里数，新开的连接还看不到这次 UPDATE
+    left = list_need_ack(pid)
+    return {"ok": True, "kind": kind, "id": rid, "status": r["status"],
+            "note": note, "need_ack_left": len(left),
+            "next": ("还有 " + str(len(left)) + " 条欠回执，逐条 ack"
+                     if left else "回执齐了，可以继续推进")}
+
+
+def ack_gate(pid):
+    """欠回执就拦写操作。用户拍过板的那一条，是这一轮的起点，不是背景音。"""
+    need = list_need_ack(pid)
+    if not need:
+        return None
+    first = need[0]
+    return {"error": f"用户已经对「{first['title']}」做了决定（{first['decision_cn']}），"
+                     f"你还没回执。先在会话里回一句「收到」并把下一步说清，"
+                     f"再调 ack(kind='{first['kind']}', id='{first['id']}')。"
+                     f"欠回执共 {len(need)} 条。",
+            "need_ack": True, "need_ack_list": need,
+            "next_actions": [f"POST /api/projects/{pid}/ack "
+                             "{kind:'plan|retro|staff', id:'<单号>', note:'收到，下一步…'}"]}
 
 
 # ------------------------------------------------------------------ read
@@ -2870,6 +2974,8 @@ def project_state(pid):
             # 编制：工位固定，会话可换。加人/换人/撤编都挂在这张申请单上等用户批
             "staff_requests": sreq,
             "staff_pending": [s for s in sreq if s["status"] == "pending"],
+            # 欠回执：用户已经批了/驳了，总监还没回「收到」。写操作会被 ack_gate 拦。
+            "need_ack": list_need_ack(pid),
             "roster": {
                 "seats": len(members),
                 "vacant": len([m for m in members if m["roster_state"] == "vacant"]),
@@ -3390,6 +3496,13 @@ def update_task(tid, b):
             return None
         if "status" in b and b["status"] not in COLUMNS:
             return {"error": f"status must be one of {COLUMNS}"}
+        # 欠回执时不许改任务状态：用户批过的那一条必须先被「收到」，
+        # 否则下一轮会按旧编制/旧计划继续跑，而用户以为已经生效。
+        # 只挡状态迁移，不挡 progress —— 报进度不是推进，别把唯一的信息通道也堵上。
+        if "status" in b and b["status"] != t["status"]:
+            gate = ack_gate(t["project_id"])
+            if gate:
+                return gate
         # 字段归一：脏数据不入库
         for k in ("progress", "priority"):
             if k in b:
@@ -3656,6 +3769,9 @@ def project_health(pid, st=None):
                  if not (st.get("autopilot") or {}).get("ready") else ""),
                 (f"总监 {st['board']['human']}没碰计划"
                  if (st.get("board") or {}).get("derail") else ""),
+                # 欠回执：用户点过批准，总监没回「收到」——决定没生效，后续全是旧账
+                (f"{len(st.get('need_ack') or [])} 条审批已决定但没回执"
+                 if st.get("need_ack") else ""),
                 f"{len(stale)} 个工位已静默" if stale else "",
                 f"{len(orphan_tasks)} 条任务无主" if orphan_tasks else "",
                 f"{len(unseated)} 个会话没登记工位" if unseated else "",
@@ -3776,6 +3892,16 @@ def resume_brief(pid):
         actions.insert(0, "先对齐：每个在跑的人 update_task(status=doing, assignee_id=<mid>) "
                           "挂到看板上，再 member_duty(on=true) 登记在场；"
                           "任务主人已经不在跑的，先收回 backlog 再重新派人")
+    # 欠回执：用户点过批准/驳回，总监没回「收到」。这是「决定没生效」，
+    # 比任何进度数字都靠前——它会拦住改状态/新计划/导报告。
+    need_ack = st.get("need_ack") or []
+    if need_ack:
+        verdict = ("⛔ 欠回执 " + str(len(need_ack)) + " 条（用户已决定、你没回话）："
+                   + "、".join(f"{x['label']}·{x['title'][:16]}（{x['decision_cn']}）"
+                               for x in need_ack[:3])
+                   + "。先逐条 ack 回「收到」并说下一步。 | " + verdict)
+        actions.insert(0, "先回执：" + "；".join(
+            f"ack(kind='{x['kind']}', id='{x['id']}')" for x in need_ack[:3]))
     # 作废清单：接手的人最容易犯的错是把已经排除的路再走一遍。
     # 这条比任何进度数字都省时间，所以放在简报里，不藏在任务详情里。
     invalidated = [{"id": t["id"], "title": t["title"],
@@ -4370,6 +4496,10 @@ class Handler(BaseHTTPRequestHandler):
             if gate:
                 gate["error"] = "导出被拦：" + gate["error"]
                 return self._send(403, gate)
+            gate = ack_gate(m.group(1))
+            if gate:
+                gate["error"] = "导出被拦：" + gate["error"]
+                return self._send(403, gate)
             # 看板和实际执行体对不上时，导出的进度表就是在给用户看假账。
             gate = align_gate(m.group(1))
             if gate:
@@ -4434,7 +4564,14 @@ class Handler(BaseHTTPRequestHandler):
         m = re.fullmatch(r"/api/projects/([\w]+)/retros", p)
         if m:
             r = submit_retro(m.group(1), b)
-            return self._send(400 if "error" in r else 201, r)
+            return self._send(400 if isinstance(r, dict) and "error" in r else 201, r)
+        # 回执：用户点了批准/驳回之后，总监必须把「收到」落成一条记录
+        m = re.fullmatch(r"/api/projects/([\w]+)/ack", p)
+        if m:
+            r = ack_decision(m.group(1), (b.get("kind") or "").strip(),
+                             (b.get("id") or "").strip(),
+                             b.get("note", ""), b.get("by", ""))
+            return self._send(400 if "error" in r else 200, r)
         m = re.fullmatch(r"/api/retros/([\w]+)/decide", p)
         if m:
             r = decide_retro(m.group(1), b)

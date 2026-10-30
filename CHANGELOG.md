@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.12 — a decision the director never read is not a decision
+
+Two gaps, both measured on a live project.
+
+**Approval cards never reached the conversation.** The card only existed in `/api` and in
+the panel's own queue, so if the director did not call `approval_inbox`, the user saw
+nothing — "I submitted three rename requests" / "I don't see them". The MCP layer now
+attaches every pending plan, retro and staff request to the `structuredContent` of *every*
+tool result, so the card surfaces on the next call regardless of what the model remembers.
+
+**A decision could be ignored.** The user clicked approve, that turn ended, and the next
+turn proceeded on the old roster and old plan as if nothing had happened. Decisions and
+receipts are now separate records: `need_ack` lists everything the user decided and the
+director has not acknowledged. While it is non-empty, `update_task(status=…)`,
+`propose_plan` and report export return 403 `need_ack`; `progress` updates still pass,
+because reporting progress is not the same as advancing. New MCP tool `ack`; the `decide`
+result now says "reply 收到 now, then ack".
+
+Existing databases grandfather every already-decided row when `ack_at` is added — old
+decisions are not re-litigated.
+
+Tests: decide → `need_ack` appears → status change 403 → `ack` → gate opens → not counted
+twice.
+
 ## 0.3.11 — everyone has to be on the board
 
 `idle` answers "is anyone working". It cannot answer **"which task is that person working on"**.

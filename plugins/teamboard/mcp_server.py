@@ -183,10 +183,63 @@ def _board_line(st):
             f"→ 先 update_task 报一次真实进度，再谈别的。")
 
 
+def _need_ack_line(st):
+    """用户已经拍过板、总监还没回「收到」。排在所有进度数字前面。"""
+    need = st.get("need_ack") or []
+    if not need:
+        return ""
+    first = need[0]
+    return (f"⛔ 欠回执 {len(need)} 条：{first['label']}「{first['title'][:20]}」"
+            f"{first['decision_cn']}，你还没回话。"
+            f"→ 先在会话里回「收到」并说下一步，再 ack(kind='{first['kind']}', "
+            f"id='{first['id']}')。不回执：改状态/新计划/导报告全被 403。")
+
+
+def _augment(name, args, text, sc):
+    """每个工具结果都带上「待审批卡 + 欠回执」。
+
+    为什么放在这一层而不是每个工具里各写一遍：卡片能不能出现在会话里，
+    取决于宿主渲染 tool result 的 structuredContent。只要模型没调
+    approval_inbox，审批卡就不会出现——实测过：总监说「我提交了 3 张改名申请」，
+    用户回「我没看到」。所以让每一次工具调用都把它推一遍，不依赖模型记性。
+    """
+    if name == "tb_api" or not isinstance(sc, dict):
+        return text, sc
+    pid = (sc.get("project_id")
+           or ((sc.get("project") or {}).get("id")
+               if isinstance(sc.get("project"), dict) else "")
+           or ((sc.get("approval") or {}).get("project_id") or "")
+           or ((sc.get("staff_request") or {}).get("project_id") or "")
+           or "")
+    if not pid:
+        return text, sc
+    try:
+        st = http("GET", "/api/projects/" + pid)
+    except Exception:                                   # noqa: BLE001
+        return text, sc
+    cards = []
+    for a in (st.get("pending_approvals") or []):
+        cards.append({"kind": "plan", "project_id": pid, "data": a})
+    latest = ((st.get("retro") or {}).get("latest") or {})
+    if (latest.get("status") or "") == "submitted":
+        cards.append({"kind": "retro", "project_id": pid, "data": latest})
+    for s in (st.get("staff_pending") or []):
+        cards.append({"kind": "staff", "project_id": pid, "data": s})
+    if cards:
+        sc = dict(sc)
+        sc["pending"] = cards
+    line = _need_ack_line(st)
+    if line:
+        text = line + "\n\n" + (text or "")
+    return text, sc
+
+
 def summarize(p):
     st = http("GET", "/api/projects/" + p["id"])
     s = st["stats"]
     lines = [f"# {p['name']}　{s['overall']}%",
+             # 欠回执必须排在「有没有人在干活」之前：它是这一轮的起点。
+             _need_ack_line(st),
              # 第一句永远是「有没有人在干活」。
              # 放在排期/进度前面是故意的：这两个数字都能在自己埋头干的时候慢慢变好，
              # 只有 idles 不会。总监最容易漏掉的就是这一行。
@@ -442,6 +495,15 @@ TOOLS = [
          "note": {"type": "string", "description": "驳回原因（reject 时必填）"},
          "confirm_over_cap": {"type": "boolean", "description": "计划超过 5 人上限时，批准必须带 true"}},
       "required": ["kind", "id", "decision"]}},
+    {"name": "ack", "title": "回执「收到」",
+     "description": "回执：用户点过批准/驳回之后必须调用一次。把「收到 + 下一步」落库，解除 ack_gate（欠回执时改任务状态 / 提新计划 / 导报告一律 403）。每次 decide 或用户在面板点完之后，第一件事就是 ack，然后在会话里说「收到」并说明下一步",
+     "inputSchema": {"type": "object", "properties": {
+         "project": {"type": "string", "description": "项目名或 id，留空取最近一个"},
+         "kind": {"type": "string", "enum": ["plan", "retro", "staff"]},
+         "id": {"type": "string", "description": "审批单 id（approval_inbox / need_ack 里拿）"},
+         "note": {"type": "string",
+                  "description": "你对用户说的那句「收到」后面跟的下一步动作，写清楚要动谁、动哪条任务"}},
+      "required": ["kind", "id"]}},
     {"name": "goal_audit", "description": "目标合规体检：目标/验收标准是否有、每个任务是否挂在阶段上、产出与证据是否达标。分配任务前和交付前各跑一次",
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "string", "description": "项目名或 id，留空取最近一个"}}}},
@@ -861,8 +923,26 @@ def call(name, args):
         r = http("POST", path, body)
         if isinstance(r, dict) and r.get("error"):
             return "没落库：" + r["error"], r
-        return (f"{kind} {rid} 已{'批准' if d == 'approve' else '驳回'}。"), \
-               {"decided": r, "kind": kind, "decision": d}
+        # 决定落库 ≠ 总监知道了。用户点完之后，下一句必须是「收到」，
+        # 否则下一轮它照旧按旧编制/旧计划跑——欠回执会被 ack_gate 拦。
+        return (f"{kind} {rid} 已{'批准' if d == 'approve' else '驳回'}。\n"
+                f"**现在立刻回一句「收到」**，并说清下一步动谁/动哪条任务，然后调 "
+                f"ack(kind='{kind}', id='{rid}', note='收到，下一步…')。"
+                f"不回执的话：改任务状态、提新计划、导报告都会被 403 拦住。"), \
+               {"decided": r, "kind": kind, "decision": d,
+                "need_ack": {"kind": kind, "id": rid}}
+
+    if name == "ack":
+        p = pick_project(args.get("project", ""))
+        kind, rid = args.get("kind"), args.get("id", "")
+        r = http("POST", f"/api/projects/{p['id']}/ack",
+                 {"kind": kind, "id": rid, "note": args.get("note", ""),
+                  "by": args.get("by") or "项目总监"})
+        if isinstance(r, dict) and r.get("error"):
+            return "回执没落库：" + r["error"], r
+        left = int(r.get("need_ack_left") or 0)
+        tail = (f"还有 {left} 条欠回执，逐条 ack" if left else "回执齐了，闸门解锁")
+        return (f"已回执「收到」：{kind} {rid}（{r.get('status')}）。{tail}"), r
 
     if name == "bind_member":
         p = pick_project(args.get("project", ""))
@@ -1068,7 +1148,11 @@ def main():
         elif method == "tools/call":
             params = msg.get("params", {})
             try:
-                text, struct = call(params.get("name"), params.get("arguments") or {})
+                _args = params.get("arguments") or {}
+                text, struct = call(params.get("name"), _args)
+                # 审批卡与欠回执挂在每一次工具结果上：模型漏调 approval_inbox 时，
+                # 卡片仍然会出现在会话里（见 _augment 的说明）。
+                text, struct = _augment(params.get("name"), _args, text, struct)
                 reply(rid, {"content": [{"type": "text", "text": text}],
                             "structuredContent": struct, "isError": False})
             except Exception as e:  # noqa: BLE001

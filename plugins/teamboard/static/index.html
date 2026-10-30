@@ -763,6 +763,15 @@ function idleBanner(){
     </div>`);
   }
   const B=S.board||{};
+  // 欠回执：用户点过批准，总监没回「收到」——决定没生效，接下来的动作会被拦。
+  const NA=S.need_ack||[];
+  if(NA.length){
+    rows.push(`<div class="idleb warn">
+      <span>⚠ <b>欠回执 ${NA.length} 条</b>　用户已经决定，总监还没回「收到」：
+      ${NA.slice(0,3).map(x=>`${esc(x.label)}·${esc((x.title||"").slice(0,14))}（${esc(x.decision_cn)}）`).join("、")}
+      　→ 改状态 / 新计划 / 导报告会被拒绝</span>
+    </div>`);
+  }
   // 对齐：在跑的人挂的是哪一条。idle 绿了也可能整队都在账外干活——
   // 那时候进度条在涨，实际产出为零。这一条拦写操作，所以用坏色。
   const AL=S.align||{};

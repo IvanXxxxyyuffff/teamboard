@@ -1053,6 +1053,14 @@ function idleBanner(){
     </div>`);
   }
   const B=S.board||{};
+  // 欠回执：用户点过批准，总监没回「收到」——决定没生效。
+  const NA=S.need_ack||[];
+  if(NA.length){
+    rows.push(`<div class="idleb warn">
+      <span>⚠ <b>欠回执 ${NA.length} 条</b>　用户已决定，总监还没回「收到」：
+      ${NA.slice(0,3).map(x=>`${esc(x.label)}·${esc((x.title||"").slice(0,14))}（${esc(x.decision_cn)}）`).join("、")}</span>
+    </div>`);
+  }
   // 对齐：在跑的人挂的是哪一条。idle 绿了也可能整队都在账外干活。
   const AL=S.align||{};
   if(AL.ok===false){
@@ -2003,6 +2011,9 @@ async function decideStaff(decision){
                    {decision,by:"user"});
   if(r&&r.error){ toast(r.error); return; }
   closeApproval(); await refresh(); nextPending();
+  // 决定落库只是「用户拍板」，总监那边还必须回一句「收到」——不回执，
+  // 改状态/新计划/导报告都会被 ack_gate 拦。这里明说，免得用户以为已经生效。
+  toast((decision==="approve"?"已批准。":"已驳回。")+"总监需要回一句「收到」后才会继续。","ok");
 }
 
 async function decideApproval(decision){
@@ -2018,6 +2029,7 @@ async function decideApproval(decision){
   const r=await api("POST","/api/approvals/"+APR.id+"/decide",body);
   if(r&&r.error){ toast(r.error); return; }
   if(r&&r.apply_errors&&r.apply_errors.length) toast("已批准，但有部分落库失败：\n"+r.apply_errors.join("\n"));
+  else toast("已"+(decision==="approve"?"批准":"驳回")+"。总监需要回一句「收到」后才会继续。","ok");
   closeApproval();
   await refresh();
   nextPending();

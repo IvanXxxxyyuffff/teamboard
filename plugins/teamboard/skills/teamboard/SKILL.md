@@ -106,6 +106,20 @@ description: 当用户问「我的团队现在在做什么 / 项目进度怎么�
 三条纪律：**开工先挂号**（第一个动作是 `update_task(doing)`，不是先看代码）、
 **收工就摘牌**（`done` + `member_duty(on=false)`）、**换会话不算换人**（`bind_member` 不走审批）。
 
+### 审批回执（`need_ack` / `ack`）
+
+用户在面板里点了批准/驳回，不等于总监知道了。那一轮常常已经结束，下一条消息
+如果不强制回执，它会当没发生——照旧按旧编制跑，而用户以为已经生效。
+
+```json
+"need_ack": [{"kind": "staff", "id": "stf_1a2b3c", "label": "编制变更",
+              "decision_cn": "已批准", "title": "加人：后端（缺人）"}]
+```
+
+`need_ack` 非空时：先在会话里回「收到」+ 下一步，再 `ack(kind, id, note)`。
+欠回执期间 `update_task(status=...)` / `propose_plan` / 导报告 一律 403 `need_ack`；
+只改 `progress` 不受影响（报进度不是推进）。
+
 ## 拉起团队的硬流程（缺一项，服务端直接拒绝）
 
 用户说「拉起一个团队做 X」时按顺序走，不许跳步。
@@ -262,7 +276,7 @@ spawn 时 `on:true`，收工 `on:false`。它决定面板显示「工作中」�
 
 可选：`priority`、`estimate`（加权进度用）、`resource`、`evidence`。
 
-## 五个硬闸
+## 六个硬闸
 
 1. **交付物存在性**：`deliverable` 支持 `a|b`、`a + b`、`{X,Y}.md`、通配符；
    相对路径按 `project.workdir` 解析。一个文件都不存在时，`status=done` 会被拒绝（400）。
@@ -274,6 +288,8 @@ spawn 时 `on:true`，收工 `on:false`。它决定面板显示「工作中」�
    `update_task` / `heartbeat` / `bind_member` / `member_duty`。
 5. **全员对齐**：有人在跑却没挂号、任务主人已停、有活没绑会话 → 同样 403（`need_align`），
    返回三张清单 + `next_actions`；三项都空才算对齐（`align.ok=true`）。
+6. **审批回执**：用户点过批准/驳回、总监没 `ack` → 改任务状态 / 提新计划 / 导报告 403
+   `need_ack`。决定不落进脑子，等于没决定。
 
 ## 进度与停滞
 
