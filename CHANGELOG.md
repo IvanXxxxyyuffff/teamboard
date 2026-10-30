@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.23 — mid-turn commentary is not a turn ending
+
+A `message` event is written whenever the agent says something inside a turn ("Now the patch:").
+It was not on the busy list, so the seat dropped to offline for the second between that message and
+the next `token_count` — measured at `silent=10s` while the transcript was being appended to.
+`message` now counts as work; the terminal events still win because they are checked first.
+
 ## 0.3.22 — archived is not dead
 
 A subagent can be running inside a rollout that lives in `~/.codex/archived_sessions/`:

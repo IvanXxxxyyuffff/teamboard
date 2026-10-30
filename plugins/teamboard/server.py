@@ -1507,7 +1507,10 @@ TERMINAL_EVENTS = {"task_complete", "turn_aborted"}
 # user_message——这些都会被 mtime 骗成「刚写过」。
 # 黑名单做法（只排除终态）实测漏掉这一整类：重启后什么都没干，主线程亮「工作中」。
 BUSY_TAIL = {"function_call", "function_call_output", "reasoning", "token_count",
-             "item_started", "item_completed", "agent_message", "token_usage_record"}
+             "item_started", "item_completed", "agent_message", "token_usage_record",
+             # 一轮中间插话（"Now the patch:" 这种）也会落成 message；它不是收工，
+             # 不认它就会在每次开口之后闪一下「离线」（实测 silent=10s 却 offline）。
+             "message"}
 IDLE_TAIL = {"user_message"}             # 用户刚发、agent 还没动 = 等指令，不是在工作
 _TAIL_CACHE = {}
 
