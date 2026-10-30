@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.19 — take the work over, do not sweep it away
+
+A stalled seat is not junk. Recycling its task to `backlog` is irreversible: whatever it already
+figured out — the branch it ruled out, the half-finished patch, the reason it was stuck — is gone
+the moment the row says `backlog`, because nobody wrote it down.
+
+**Handover before recycle.** Moving a task from `doing` to `backlog` now requires a `resume_note`
+(unless `force=true` is passed with a reason), exactly like re-opening a half-done task does. The
+error message carries what the stalled worker said last, so the note can be written from evidence
+instead of memory.
+
+**`GET /api/tasks/<id>/handover`.** One call answers "is any of this worth keeping": the task's
+progress and checkpoint, the seat and agent that held it, the last four tools it ran, and the last
+thing it said (read from the transcript tail, cached by size+mtime), plus the four next moves —
+verify the artifact, continue with a note, reassign, or abandon with a reason.
+
+**The nudge says so too.** A ghost item no longer reads "recycle it and reassign"; it names the
+worker's last sentence and points at the handover endpoint first. Recycle stays available; it just
+stops being the reflex.
+
 ## 0.3.18 — an empty chair is not a headcount
 
 Two things the nudge was getting wrong about idle capacity.

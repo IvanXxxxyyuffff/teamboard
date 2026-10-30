@@ -473,8 +473,14 @@ def main():
                                     {"status": "doing", "assignee_id": w3["id"]})
         check("new work is refused until the leftovers are reconciled",
               code in (400, 403) and blocked_resume.get("need_resume"), blocked_resume)
-        # 处置：把烂尾收回 backlog 就算对齐，闸立刻放行
-        call(base, "PATCH", f"/api/tasks/{t3['id']}", {"status": "backlog"})
+        # 回收不是「一键清账」：doing 的任务先要交接（读到做到哪），才允许收回。
+        code, no_hand = call(base, "PATCH", f"/api/tasks/{t3['id']}", {"status": "backlog"})
+        check("a doing task cannot be recycled without a handover note",
+              code in (400, 403) and no_hand.get("need_handover"), no_hand)
+        # 处置：接手过（写了断点）再把烂尾收回 backlog，闸立刻放行
+        call(base, "PATCH", f"/api/tasks/{t3['id']}",
+             {"status": "backlog",
+              "resume_note": "跑过一轮：2/5 接口通了，剩余 3 条没验证，下一步从 live 链开始"})
         # 派活必须有主：没有 assignee 的 doing，谁也没法追
         code, t6 = call(base, "POST", f"/api/projects/{pid3}/tasks",
                         {"title": "没有主的活", "estimate": 1,

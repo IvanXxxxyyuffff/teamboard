@@ -1555,6 +1555,63 @@ def session_tail(path):
     return info
 
 
+_DIGEST_CACHE = {}
+
+
+def session_digest(path, head_chars=240):
+    """会话尾部「他最后说了什么、最后在跑什么」。
+
+    接手一个僵住的工位时，这是唯一能避免「从 0 重来」的原始材料：
+    task_complete 里带着这一轮最后一段话（last_agent_message），
+    前面的 function_call 带着他最后在跑什么。只读尾部 60KB。
+    """
+    if not path:
+        return {}
+    try:
+        st = os.stat(path)
+    except OSError:
+        return {}
+    key = (st.st_size, int(st.st_mtime))
+    hit = _DIGEST_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    info = {"last_message": "", "last_tools": [], "last_at": ""}
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, st.st_size - 60000))
+            lines = [x for x in f.read().decode("utf-8", "ignore").strip().splitlines()
+                     if x.lstrip().startswith("{")]      # 尾部常留半行
+        tools = []
+        for ln in reversed(lines):
+            try:
+                d = json.loads(ln)
+            except Exception:                       # noqa: BLE001
+                continue
+            pl = d.get("payload") or {}
+            t = (pl.get("type") if isinstance(pl, dict) else "") or d.get("type") or ""
+            if not info["last_message"]:
+                txt = ""
+                if t == "task_complete":
+                    txt = (pl.get("last_agent_message") or "").strip()
+                elif t == "message" and pl.get("role") == "assistant":
+                    txt = "".join(c.get("text", "") for c in (pl.get("content") or [])
+                                  if isinstance(c, dict)).strip()
+                if txt:
+                    info["last_message"] = txt[:head_chars]
+                    info["last_at"] = d.get("timestamp", "")
+            if t == "function_call" and len(tools) < 4:
+                nm = pl.get("name") or ""
+                if nm:
+                    tools.append(nm)
+            if info["last_message"] and len(tools) >= 4:
+                break
+        info["last_tools"] = list(reversed(tools))
+    except OSError:
+        info = {"last_message": "", "last_tools": [], "last_at": ""}
+    _DIGEST_CACHE[path] = (key, info)
+    return info
+
+
 def agent_info(path):
     """会话头的身份字段：agent_path = /root/quest10_device，nickname = Copernicus。
 
@@ -2339,6 +2396,12 @@ def project_state(pid):
         m["agent_nickname"] = ap.get("agent_nickname") or ""
         m["agent_leaf"] = (m["agent_path"].rstrip("/").split("/")[-1]
                            if m["agent_path"] else "")
+        # 他最后说的那句话 / 最后在跑什么：接手僵住工位的第一手材料，
+        # 比「没有断点记录，先查产物和日志」有用得多。
+        _dg = session_digest((_LIVE_CACHE.get("paths") or {}).get(tid0, "")) if tid0 else {}
+        m["last_say"] = _dg.get("last_message") or ""
+        m["last_tools"] = _dg.get("last_tools") or []
+        m["last_say_at"] = _dg.get("last_at") or ""
         # mtime 新 ≠ 有人在干：退出 Codex 时它会补一笔 turn_aborted / task_complete。
         # 最后一笔是「收工」，这条会话此刻就没有在跑——不管 mtime 有多新。
         # 而且「写了文件」也只证明写过：重启补的 session_meta、用户发消息写的
@@ -2951,7 +3014,11 @@ def project_state(pid):
                                     # 上次做到哪：续跑的第一句话必须能用上它
                                     "progress": safe_int(t0.get("progress"), 0, 0, 100),
                                     "checkpoint": (t0["checkpoint"] if "checkpoint" in t0.keys()
-                                                   else "") or ""})
+                                                   else "") or "",
+                                    # 他最后一段话：接手的人先读这个，再决定回收还是继续
+                                    "last_say": m.get("last_say") or "",
+                                    "last_tools": m.get("last_tools") or [],
+                                    "last_say_at": m.get("last_say_at") or ""})
         if m["session_live"] and not active_mine and open_n:
             last = max(_last_touch.get(m["id"], 0), float(m.get("bound_at") or 0))
             gap = int(now - last) if last > 0 else -1
@@ -2984,11 +3051,17 @@ def project_state(pid):
                             "task_id": task_id, "member_id": member_id})
 
     for g in align["ghost"]:
+        _say = (g.get("last_say") or "").replace("\n", " ").strip()
         _nitem("ghost", g["name"],
                f"任务挂着人没了：{g['task']}（上次做到 {g.get('progress') or 0}%）",
-               f"先确认 {g['name']} 还在不在跑；不在就收回 backlog 再重派，或 spawn 重开 + bind_member。"
-               f"不管谁接手：先读断点（{(g.get('checkpoint') or '没有断点记录，先查产物和日志')[:40]}），"
-               f"写 resume_note 再继续——不许从 0 重来",
+               (f"别直接收回——先接手工位，看他做到哪了。他最后一句：{_say[:80]}。"
+                f"先 GET /api/tasks/{g.get('task_id','')}/handover 读断点与产物，"
+                f"把结论写进 resume_note，再改派给活人 update_task(assignee_id=…)；"
+                f"确认这段活确实作废，才允许收回 backlog 并写 abandoned_reason。"
+                if _say else
+                f"先接手工位：GET /api/tasks/{g.get('task_id','')}/handover 读断点"
+                f"（{(g.get('checkpoint') or '没有断点记录')[:40]}）与产物，"
+                f"写 resume_note 再改派给活人；确认作废才收回 backlog。不许从 0 重来"),
                g.get("hung_sec"), g.get("task_id", ""), g.get("id", ""))
     for u in align["unlogged"]:
         _nitem("unlogged", u["name"], "在跑，但名下没有任何在办任务",
@@ -3751,6 +3824,20 @@ def update_task(tid, b):
                                "哪条路已排除、下一步」写进 resume_note 再继续。",
                     "field": "resume_note", "need_resume_note": True,
                     "checkpoint": prev_ck, "progress": prev_progress}
+        # 回收也要交接：doing → backlog 是最容易「把一小时半直接扔掉」的动作。
+        # 进度 0% 不代表没干活——实测设备线跑了一小时半，进度还是 0。
+        if st == "backlog" and t["status"] == "doing" and not note and not b.get("force"):
+            spent = safe_int(t["time_spent"] if "time_spent" in t.keys() else 0, 0, 0)
+            started = float((t["doing_since"] if "doing_since" in t.keys() else 0) or 0) > 0
+            if spent > 0 or started:
+                _hs = task_handover(tid) or {}
+                _say = (_hs.get("last_say") or "").replace("\n", " ")[:60]
+                return {"error": "这条还在 doing，不能直接回收：先接手工位读一遍"
+                                 + (f"（他最后一句：{_say}）" if _say else "")
+                                 + "，把「做到哪 / 哪条路已排除 / 下一步」写进 resume_note "
+                                   "再回收；确认整条作废就带 force=true 并说明原因。",
+                        "field": "resume_note", "need_handover": True,
+                        "handover_url": f"/api/tasks/{tid}/handover"}
         if note:
             # 复盘结论本身就是断点：写下它，下一次换人接手读同一份
             b["checkpoint"] = note
@@ -4065,6 +4152,53 @@ def project_health(pid, st=None):
                 f"{len(orphan_tasks)} 条任务无主" if orphan_tasks else "",
                 f"{len(unseated)} 个会话没登记工位" if unseated else "",
                 f"{len(vacant)} 个空工位" if vacant else ""])) or "全部对得上"}
+
+
+def task_handover(task_id):
+    """接手一个僵住/断线的工位：一屏看完他做到哪、最后说了什么、下一步做什么。
+
+    用户的原话：「万一他手上有很重要的工作没做完，直接回收了不浪费吗？」
+    「回收」不可逆，交接可逆——所以先给交接，再谈回收。
+    """
+    with db() as c:
+        row = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if not row:
+        return None
+    t = dict(row)
+    m = {}
+    if t.get("assignee_id"):
+        with db() as c:
+            mr = c.execute("SELECT * FROM members WHERE id=?",
+                           (t["assignee_id"],)).fetchone()
+        if mr:
+            m = dict(mr)
+    tid = (m.get("thread_id") or "").strip()
+    dg = session_digest(session_path_of(tid)) if tid else {}
+    return {
+        "task": {"id": t["id"], "title": t["title"], "status": t["status"],
+                 "progress": safe_int(t.get("progress"), 0, 0, 100),
+                 "checkpoint": t.get("checkpoint") or "",
+                 "deliverable": t.get("deliverable") or "",
+                 "evidence_path": t.get("evidence_path") or "",
+                 "verify_cmd": t.get("verify_cmd") or "",
+                 "updated_at": t.get("updated_at") or ""},
+        "member": {"id": m.get("id") or "", "name": m.get("name") or "",
+                   "seat": (f"#{int(m.get('seat_no') or 0):02d}"
+                            if m.get("seat_no") else ""),
+                   "agent": m.get("agent_path") or "",
+                   "nickname": m.get("agent_nickname") or ""},
+        "last_say": dg.get("last_message") or "",
+        "last_tools": dg.get("last_tools") or [],
+        "last_say_at": dg.get("last_at") or "",
+        "next": [
+            "1) 读 last_say / checkpoint：他做到哪、哪些路已经排除",
+            "2) 有产物就先验：evidence_path 在不在？verify_cmd 跑得通吗？",
+            "3) 能继续 → update_task(task=<id>, assignee_id=<新手>, status='doing', "
+            "resume_note='…从这里的下一步开始')",
+            "4) 确实作废 → update_task(task=<id>, status='abandoned', "
+            "abandoned_reason='为什么不再需要')",
+        ],
+    }
 
 
 def resume_brief(pid):
@@ -4732,6 +4866,11 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             r = resume_brief(m.group(1))
             return self._send(200 if r else 404, r or {"error": "no such project"})
+        # 接手僵住工位前先读这一份：他最后说了什么、做到哪、下一步该怎么接。
+        m = re.fullmatch(r"/api/tasks/([\w]+)/handover", p)
+        if m:
+            r = task_handover(m.group(1))
+            return self._send(200 if r else 404, r or {"error": "no such task"})
         m = re.fullmatch(r"/api/threads/([\w-]+)", p)
         if m:
             r = member_by_thread(m.group(1))
