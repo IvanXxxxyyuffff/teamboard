@@ -389,6 +389,17 @@ def main():
         check("a member working off-board is flagged as unlogged",
               al.get("ok") is False
               and any(x["name"] == "工程甲" for x in (al.get("unlogged") or [])), al)
+
+        # 催办：闸只在他伸手时咬人，人不伸手项目就停。nudge 必须自己开口，
+        # 而且要说「该谁做什么」——只报状态等于又一张没人看的状态卡。
+        nd = st3.get("nudge") or {}
+        kinds = {x.get("kind") for x in (nd.get("items") or [])}
+        check("off-board work raises the nudge list",
+              nd.get("level") == "shout" and (nd.get("count") or 0) >= 2
+              and {"unlogged", "unassigned"} <= kinds, nd)
+        check("the nudge carries an actionable sentence, not just a status word",
+              bool(nd.get("must")) and "update_task" in json.dumps(nd, ensure_ascii=False),
+              nd.get("must"))
         code, denied2 = call(base, "POST", f"/api/projects/{pid2}/approvals",
                              {"goal": "g", "goal_criteria": "c", "priority_ratio": "1:1:0",
                               "members": [], "tasks": []})
@@ -400,6 +411,11 @@ def main():
         check("registering the task clears the alignment gate",
               (st4.get("align") or {}).get("ok") is True,
               {k: st4.get("align", {}).get(k) for k in ("unlogged", "ghost", "nosession")})
+        # 催办不是常驻噪音：事做掉了，那一行必须自己消失
+        kinds4 = {x.get("kind") for x in ((st4.get("nudge") or {}).get("items") or [])}
+        check("the nudge item disappears once the work is registered",
+              "unlogged" not in kinds4 and "unassigned" not in kinds4,
+              st4.get("nudge"))
 
         # 回执闸：用户点了批准，总监必须回一句「收到」。不回执就改状态/提计划/导报告，
         # 决定永远停在库里——下一轮照旧按旧编制跑，而用户以为已经生效。

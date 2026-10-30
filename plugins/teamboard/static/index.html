@@ -750,6 +750,17 @@ function idleBanner(){
   if(!box) return;
   const I=S.idle||{}, A=S.autopilot||{};
   const rows=[];
+  // 催办：这张单子只回答「现在该谁做什么」。排在状态横幅之前。
+  const N=S.nudge||{};
+  if(N.count){
+    const who=(N.items||[]).slice(0,3)
+      .map(x=>esc(x.who)+"："+esc((x.what||"").slice(0,26))).join("；");
+    const ago=N.human?("（最久 "+esc(N.human)+"）"):"";
+    rows.push('<div class="idleb '+(N.level==="shout"?"bad":"warn")+'">'
+      +'<span>⏰ <b>催办 '+N.count+' 条'+ago+'</b>　'+who+'</span>'
+      +'<span class="more" title="'+esc(N.must||"")+'">现在该做</span>'
+      +'</div>');
+  }
   if(I.warn){
     const who=(I.silent||[]).slice(0,4)
       .map(x=>`${esc(x.name)} ${x.silent>=0?dur(x.silent):"无会话"}`).join("　");

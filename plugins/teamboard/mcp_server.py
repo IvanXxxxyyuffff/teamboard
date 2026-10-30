@@ -195,6 +195,30 @@ def _need_ack_line(st):
             f"id='{first['id']}')。不回执：改状态/新计划/导报告全被 403。")
 
 
+def _nudge_line(st):
+    """催办：这一刻必须有人做的事。
+
+    闸只在他伸手的时候咬人；他不伸手，项目就停。所以每一次工具返回都先把这张
+    清单顶到最前面——这是「让插件催着干活」唯一的落地点，而不是再写一段嘱咐。
+    清单没有静音开关：唯一让它变短的办法是把事做掉。
+    """
+    n = st.get("nudge") or {}
+    if not n.get("count"):
+        return ""
+    items = n.get("items") or []
+
+    def _cut(s, n_=76):
+        s = (s or "").strip()
+        return s if len(s) <= n_ else s[:n_] + "…"
+    # 只放前两条、每条截断：催办条太长会被整段跳过，和没有一样
+    says = "；".join(_cut(x.get("say", "")) for x in items[:2])
+    head = f"⛔ 催办 {n['count']} 条" if n.get("level") == "shout" else f"⏰ 催办 {n['count']} 条"
+    age = f"（最久 {n['human']}）" if n.get("human") else ""
+    more = f"；还有 {n['count'] - 2} 条" if n["count"] > 2 else ""
+    return (f"{head}{age}：{n.get('headline') or ''}。→ {says}{more}。"
+            f"这张单子清不空，开新计划/加人/交报告一律 403。")
+
+
 def _augment(name, args, text, sc):
     """每个工具结果都带上「待审批卡 + 欠回执」。
 
@@ -228,9 +252,10 @@ def _augment(name, args, text, sc):
     if cards:
         sc = dict(sc)
         sc["pending"] = cards
-    line = _need_ack_line(st)
-    if line:
-        text = line + "\n\n" + (text or "")
+    # 顺序是刻意的：先催办（现在该谁动手），再欠回执（用户已经拍了板，还没回话）。
+    head = "\n\n".join(filter(None, [_nudge_line(st), _need_ack_line(st)]))
+    if head:
+        text = head + "\n\n" + (text or "")
     return text, sc
 
 
@@ -240,6 +265,8 @@ def summarize(p):
     lines = [f"# {p['name']}　{s['overall']}%",
              # 欠回执必须排在「有没有人在干活」之前：它是这一轮的起点。
              _need_ack_line(st),
+             # 催办：不是描述现状，是「现在该谁做什么」。排在所有统计数字前面。
+             _nudge_line(st),
              # 第一句永远是「有没有人在干活」。
              # 放在排期/进度前面是故意的：这两个数字都能在自己埋头干的时候慢慢变好，
              # 只有 idles 不会。总监最容易漏掉的就是这一行。

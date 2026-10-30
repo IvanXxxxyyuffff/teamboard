@@ -1939,6 +1939,7 @@ def automation_status(lead_thread):
                 "已经停掉的会直接从列表里消失——看上去一片正常，其实一个人都没在干活。\n"
                 "- idle.alert=true → 全员停摆：先给每个空工位派活（update_task 认领 "
                 "+ member_duty），一个都不许留空；\n"
+                "- 每次醒来先读 nudge.items：它按「最要紧」排序，写着该谁做什么；清空它再干别的；\n"
                 "- align.ok=false → 有人没对齐看板（在跑没挂号 / 任务主人已停 / 有活没绑会话）："
                 "先按 align 的三张清单逐条修，修完再谈进度；\n"
                 "- 有成员 state≠working 却挂着 doing 任务 → 先回收或重开（spawn → bind_member），"
@@ -2024,7 +2025,10 @@ def autopilot_prompt(pid, name):
         f"【{name or pid} · 自驱守夜】没有用户的新消息，这一轮是你自己被心跳叫醒的。"
         "按顺序执行，不许跳步：\n"
         "\n"
-        "1) 看团队（第一件事，不可跳过）：调用 teamboard 的 project_status，读 idle 字段。\n"
+        "0) 先读催办：调用 teamboard 的 project_status，把 nudge.items 从上到下清空。\n"
+        "   每一条都写着「该谁做什么」——照着调对应的接口就行，不用自己判断。\n"
+        "   nudge 清不空，开新计划/加人/交报告会被 403，这一轮等于白醒。\n"
+        "1) 看团队（不可跳过）：同一个 project_status 里的 idle 字段。\n"
         "   - idle.alert = true（全员停摆）→ 立刻派活：把 backlog 里优先级最高的任务 "
         "update_task 认领 + member_duty 分工给每个人；一个工位都不许空着。\n"
         "   - align.ok = false（团队没对齐看板）→ 按 align.unlogged / align.ghost / "
@@ -2923,6 +2927,80 @@ def project_state(pid):
              "grace_sec": ALIGN_GRACE_SEC, "ghost_grace_sec": ALIGN_GHOST_GRACE_SEC,
              # 脱轨只报不拦：它不能进 ok，否则总监想重排计划时会被自己的闸挡住
              "derail": derail}
+    # ------------------------------------------------------------ 催办 (nudge)
+    # 闸只会在总监伸手的那一刻咬人；他不伸手，项目就停在原地——这正是「总监从不看团队」
+    # 的制度化成因。所以除了拦，还得「催」：把此刻必须有人做的事排成一张清单，
+    # 跟着每一次工具返回推到总监脸上。清单**不可静音**——唯一让它变短的办法是把事做掉。
+    need_ack_list = list_need_ack(pid)
+    nudge_items = []
+
+    def _nitem(kind, who, what, say, age=0, task_id="", member_id=""):
+        nudge_items.append({"kind": kind, "who": who, "what": what, "say": say,
+                            "age_sec": int(age or 0),
+                            "human": _hm(age) if age and age > 0 else "",
+                            "task_id": task_id, "member_id": member_id})
+
+    for g in align["ghost"]:
+        _nitem("ghost", g["name"], f"任务挂着人没了：{g['task']}",
+               f"先确认 {g['name']} 还在不在跑；不在就把「{g['task'][:16]}」收回 backlog 再重派，"
+               f"或 spawn 重开后 bind_member",
+               g.get("hung_sec"), g.get("task_id", ""), g.get("id", ""))
+    for u in align["unlogged"]:
+        _nitem("unlogged", u["name"], "在跑，但名下没有任何在办任务",
+               f"让 {u['name']} 立刻 update_task(status='doing', assignee_id='{u.get('id','')}')，"
+               f"或者把它停掉——不挂号的工作，看板看不见",
+               u.get("unlogged_sec"), "", u.get("id", ""))
+    for x in align["nosession"]:
+        _nitem("nosession", x["name"], f"有活没绑会话：{x['task']}",
+               f"bind_member(member_id='{x.get('id','')}', thread_id='<全 UUID>')",
+               0, x.get("task_id", ""), x.get("id", ""))
+    # 有人闲着、账上还有待办：这是最该先说的一句——它在浪费编制
+    idle_workers = [m for m in workers if m["state"] != "working"]
+    backlog_tasks = [t for t in open_tasks if t["status"] == "backlog"]
+    if backlog_tasks and idle_workers:
+        t0, m0 = backlog_tasks[0], idle_workers[0]
+        _nitem("unassigned", m0.get("name") or "?",
+               f"{len(backlog_tasks)} 条待办没人接，{len(idle_workers)} 个员工闲着",
+               f"把「{t0['title'][:20]}」派给 {m0.get('name')}：update_task(task='{t0['id']}', "
+               f"status='doing', assignee_id='{m0['id']}')",
+               0, t0["id"], m0["id"])
+    for t in open_tasks:
+        if t["status"] == "doing" and t.get("stale_level") in ("warn", "crit"):
+            _nitem("stalled", t.get("assignee") or "?",
+                   f"「{t['title'][:20]}」{_hm(t.get('stale_sec') or 0)}没更新",
+                   f"问一句卡在哪：update_task(task='{t['id']}', progress=…, blocked_reason=…) "
+                   f"把卡点写回看板", t.get("stale_sec") or 0, t["id"], "")
+            break
+    if derail:
+        _nitem("derail", "总监", f"{_hm(board_silent)}没碰过计划",
+               "先 update_task 报一次真实进度，再谈新计划", board_silent, "", "")
+    for a in need_ack_list[:2]:
+        _nitem("need_ack", "总监", f"{a['label']}「{a['title'][:18]}」{a['decision_cn']}",
+               f"先在会话里回「收到」，再 ack(kind='{a['kind']}', id='{a['id']}')", 0, "", "")
+    if workers and not auto.get("found"):
+        _nitem("no_autopilot", "总监", "没有自驱心跳",
+               'POST /api/projects/' + pid + '/autopilot {"action":"enable"} —— 没有它，'
+               "用户一闭嘴，这一轮就永远不会再来", 0, "", "")
+    elif auto.get("found") and (not auto.get("has_board_check") or auto.get("too_slow")):
+        _nitem("autopilot_bad", "总监",
+               ("自驱心跳没让总监先看团队板" if not auto.get("has_board_check")
+                else f"自驱每 {auto.get('interval_min')} 分钟才醒一次"),
+               f'POST /api/projects/{pid}/autopilot {{"action":"patch"}} —— '
+               f"醒得再勤，不看团队也等于没醒", 0, "", "")
+
+    worst = max([x["age_sec"] for x in nudge_items] or [0])
+    nudge_level = ("shout" if (idle_alert or not align["ok"] or need_ack_list)
+                   else ("warn" if nudge_items else "ok"))
+    nudge = {"level": nudge_level, "count": len(nudge_items),
+             "items": nudge_items[:12],
+             "worst_sec": worst, "human": _hm(worst) if worst else "",
+             "headline": (nudge_items[0]["what"] if nudge_items else ""),
+             # 一句可以直接照做的动作：催办不能只骂人，得给出下一步
+             "must": (nudge_items[0]["say"] if nudge_items else ""),
+             # 按人聚合：总监派活时按人是顺手的，按事是别扭的
+             "by_who": ({w: len([x for x in nudge_items if x["who"] == w])
+                         for w in sorted({x["who"] for x in nudge_items})}
+                        if nudge_items else {})}
     last_any = max([float(m.get("last_alive") or 0) for m in members] or [0])
     return {"project": dict(p), "members": members, "tasks": tasks, "stats": stats,
             "resume": {"orphans": len(orphans),
@@ -2975,7 +3053,9 @@ def project_state(pid):
             "staff_requests": sreq,
             "staff_pending": [s for s in sreq if s["status"] == "pending"],
             # 欠回执：用户已经批了/驳了，总监还没回「收到」。写操作会被 ack_gate 拦。
-            "need_ack": list_need_ack(pid),
+            "need_ack": need_ack_list,
+            # 催办：此刻必须有人做的事，按「最要紧」排序。每次工具返回都会推到总监脸上。
+            "nudge": nudge,
             "roster": {
                 "seats": len(members),
                 "vacant": len([m for m in members if m["roster_state"] == "vacant"]),
@@ -3774,13 +3854,19 @@ def project_health(pid, st=None):
             "orphan_tasks": orphan_tasks,
             # 对齐：三个数分开给，前端不用自己再拆
             "align": (st.get("align") or {}),
+            # 催办：这一刻必须有人做的事。面板/总监自查读同一份，别让他自己攒清单。
+            "nudge": (st.get("nudge") or {}),
             "counts": {"members": len(st["members"]), "stale": len(stale),
+                       "nudge": len((st.get("nudge") or {}).get("items") or []),
                        "vacant": len(vacant), "unseated": len(unseated),
                        "orphan_tasks": len(orphan_tasks),
                        "unlogged": len((st.get("align") or {}).get("unlogged") or []),
                        "nosession": len((st.get("align") or {}).get("nosession") or []),
                        "ghost": len((st.get("align") or {}).get("ghost") or [])},
             "summary": " · ".join(filter(None, [
+                # 催办排第一：它回答「现在该谁动手」，其余几项只描述异常。
+                (f"催办 {len((st.get('nudge') or {}).get('items') or [])} 条"
+                 if (st.get("nudge") or {}).get("count") else ""),
                 # 停摆必须排在最前面：它是唯一一条「整队都没在动」的结论，
                 # 其余几项都只是局部异常。
                 (f"全员停摆 {(st.get('idle') or {}).get('human', '')}"

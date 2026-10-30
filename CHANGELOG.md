@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.14 — the board has to speak first
+
+Gates only bite when someone reaches for them. A director who never looks at the board simply
+stops the project, and nothing in 0.3.13 could tell him that. `project_state.nudge` closes that:
+it turns "what must someone do right now" into a list — `who`, `what`, and the exact `say`
+sentence to act on — and **every MCP tool result** now starts with it (`⏰ 催办 N 条`).
+
+Sources: a task whose owner stopped running, a member running off-board, work with no session,
+idle workers while backlog exists, a `doing` task untouched for 30+ minutes, plan derail, an
+unacknowledged decision, and no usable autopilot heartbeat.
+
+There is **no mute**: no ack endpoint, no snooze. The list shrinks only when the work is done,
+and `level=shout` (idle / misaligned / unacked) also triggers the 403s — urging and blocking are
+two faces of one mechanism. The autopilot prompt now starts at step 0: empty `nudge` first, or
+the turn was wasted.
+
+Tests: off-board work raises `nudge.level=shout` with `unlogged` and `unassigned`; registering
+the task removes both items.
+
 ## 0.3.13 — "written" is not "done"
 
 Two remaining holes on the delivery surface, both reachable from the API.
