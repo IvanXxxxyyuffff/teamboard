@@ -70,6 +70,8 @@ sync "$SRC/static/home.html"          "$DST/static/home.html"          || rc=1
 sync "$SRC/static/index.html"         "$DST/static/index.html"         || rc=1
 sync "$SRC/static/theme.css"          "$DST/static/theme.css"          || rc=1
 sync "$PLG/ui/panel.html"             "$DST/ui/panel.html"             || rc=1
+# PreToolUse 闸：子代理动手前必须已在看板挂号（宿主层唯一能拦的地方）
+sync "$PLG/hooks/pretooluse.py"       "$DST/hooks/pretooluse.py"       || rc=1
 
 if [ "$CHECK" = 1 ]; then
   [ "$rc" = 0 ] && echo "OK: published tree matches sources"

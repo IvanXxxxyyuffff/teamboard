@@ -167,7 +167,9 @@ TASK_FIELDS = ("title", "detail", "role", "assignee_id", "status", "priority",
                "sort_order", "deliverable", "dod", "depends_on", "estimate",
                "progress", "blocked_reason", "milestone", "resource", "evidence",
                "due_at", "evidence_path", "abandoned_reason",
-               "verify_cmd", "verify_out", "verified_at")
+               "verify_cmd", "verify_out", "verified_at",
+               # 断点：换人/重启后先读它，不许从头来
+               "checkpoint", "checkpoint_at")
 EVIDENCE = ("observed", "inferred", "assumed")
 
 
@@ -331,6 +333,10 @@ def init_db():
             # 两件事必须能分别追责——否则「谁没回话」永远查不出来。
             ("approvals", "ack_at", "REAL DEFAULT 0"),
             ("retros", "ack_at", "REAL DEFAULT 0"),
+            # 断点：这一段做到哪、哪条路已排除、下一步。换人/重启后必须先读它，
+            # 不许从头再来——重做 13 小时等于团队凭空少一半人。
+            ("tasks", "checkpoint", "TEXT DEFAULT ''"),
+            ("tasks", "checkpoint_at", "REAL DEFAULT 0"),
         ]:
             have = {r["name"] for r in c.execute(f"PRAGMA table_info({tbl})")}
             if col not in have:
@@ -2936,7 +2942,11 @@ def project_state(pid):
                                     "seat": m.get("seat_label") or "",
                                     "state": m["state"], "hung_sec": hung,
                                     "human": _hm(hung),
-                                    "task": t0["title"], "task_id": t0["id"]})
+                                    "task": t0["title"], "task_id": t0["id"],
+                                    # 上次做到哪：续跑的第一句话必须能用上它
+                                    "progress": safe_int(t0.get("progress"), 0, 0, 100),
+                                    "checkpoint": (t0["checkpoint"] if "checkpoint" in t0.keys()
+                                                   else "") or ""})
         if m["session_live"] and not active_mine and open_n:
             last = max(_last_touch.get(m["id"], 0), float(m.get("bound_at") or 0))
             gap = int(now - last) if last > 0 else -1
@@ -2969,9 +2979,11 @@ def project_state(pid):
                             "task_id": task_id, "member_id": member_id})
 
     for g in align["ghost"]:
-        _nitem("ghost", g["name"], f"任务挂着人没了：{g['task']}",
-               f"先确认 {g['name']} 还在不在跑；不在就把「{g['task'][:16]}」收回 backlog 再重派，"
-               f"或 spawn 重开后 bind_member",
+        _nitem("ghost", g["name"],
+               f"任务挂着人没了：{g['task']}（上次做到 {g.get('progress') or 0}%）",
+               f"先确认 {g['name']} 还在不在跑；不在就收回 backlog 再重派，或 spawn 重开 + bind_member。"
+               f"不管谁接手：先读断点（{(g.get('checkpoint') or '没有断点记录，先查产物和日志')[:40]}），"
+               f"写 resume_note 再继续——不许从 0 重来",
                g.get("hung_sec"), g.get("task_id", ""), g.get("id", ""))
     for u in align["unlogged"]:
         _nitem("unlogged", u["name"], "在跑，但名下没有任何在办任务",
@@ -3694,6 +3706,42 @@ def update_task(tid, b):
 
         st = b.get("status")
         paused_flag = b.pop("paused", None)
+        # ---------------------------------------------------------- 断点续跑
+        # 「重开一遍」是这类项目里最贵的浪费：13 小时的活重做一遍，等于团队凭空少一半人。
+        # 所以三件事必须成立：
+        #   ① 接管 / 重启前先复盘（resume_note），否则不许开工；
+        #   ② 进度只能往上，回退要明写理由（confirm_restart + restart_reason），并留事件；
+        #   ③ 断点存在 checkpoint 里，换谁接手都读得到。
+        prev_progress = safe_int(t["progress"], 0, 0, 100)
+        prev_ck = (t["checkpoint"] if "checkpoint" in t.keys() else "") or ""
+        note = (b.get("resume_note") or "").strip()
+        entering = bool(st == "doing" and t["status"] != "doing")
+        handover = bool(t["status"] == "doing" and "assignee_id" in b
+                        and (b.get("assignee_id") or "") != (t["assignee_id"] or ""))
+        if (entering or handover) and (prev_progress > 0 or prev_ck.strip()) \
+                and not note and not b.get("force"):
+            return {"error": f"这条任务已经做到 {prev_progress}%"
+                             + (f"（断点：{prev_ck[:60]}）" if prev_ck.strip() else "")
+                             + "，不许从头来：先读断点/产物/日志做复盘，把「做到哪、"
+                               "哪条路已排除、下一步」写进 resume_note 再继续。",
+                    "field": "resume_note", "need_resume_note": True,
+                    "checkpoint": prev_ck, "progress": prev_progress}
+        if note:
+            # 复盘结论本身就是断点：写下它，下一次换人接手读同一份
+            b["checkpoint"] = note
+            b["checkpoint_at"] = time.time()
+        elif "checkpoint" in b:
+            b["checkpoint_at"] = time.time()
+        if "progress" in b and b["progress"] < prev_progress and not b.get("confirm_restart"):
+            return {"error": f"进度不能从 {prev_progress}% 退到 {b['progress']}%："
+                             "回退等于把之前那段工时扔掉。确实要重做，带 confirm_restart=true "
+                             "+ restart_reason（会记进事件，事后可追谁决定重做的）。",
+                    "field": "progress", "need_confirm_restart": True,
+                    "prev_progress": prev_progress}
+        if "progress" in b and b["progress"] < prev_progress and b.get("confirm_restart"):
+            if not (b.get("restart_reason") or "").strip():
+                return {"error": "重做必须写 restart_reason：为什么之前的进度作废。",
+                        "field": "restart_reason", "need_confirm_restart": True}
         # 资源硬约束：同一资源不能同时被两个 doing 任务占用
         eff_res = (b.get("resource") if "resource" in b else t["resource"]) or ""
         if (st == "doing" or (st == t["status"] == "doing")) and eff_res.strip() \
@@ -3843,7 +3891,8 @@ def update_task(tid, b):
                     c.execute("UPDATE members SET state='idle', last_seen=? WHERE id=?",
                               (time.time(), t["assignee_id"]))
         # 记下到底改了什么：只写 blocked_reason 的话，事后追不到「6820 是谁写成 Disable 的」
-        _skip = {"actor", "force", "paused", "confirm_over_cap"}
+        _skip = {"actor", "force", "paused", "confirm_over_cap", "resume_note",
+                 "confirm_restart", "restart_reason"}
         diff = {k: [t[k] if k in t.keys() else None, v]
                 for k, v in b.items() if k not in _skip and (t[k] if k in t.keys() else None) != v}
         if st and st == "blocked" and b.get("blocked_reason"):
@@ -3851,6 +3900,14 @@ def update_task(tid, b):
         log_event(c, t["project_id"], f"task.{st or 'updated'}",
                   actor=b.get("actor", ""), task_id=tid,
                   payload=json.dumps(diff, ensure_ascii=False)[:2000])
+        # 重做是「把工时扔掉」的决定，必须留一条谁、为什么——事后追得到
+        if b.get("confirm_restart"):
+            log_event(c, t["project_id"], "task.restart", actor=b.get("actor", ""),
+                      task_id=tid,
+                      payload=json.dumps({"from": prev_progress,
+                                          "to": b.get("progress"),
+                                          "reason": b.get("restart_reason", "")},
+                                         ensure_ascii=False)[:2000])
         pid = t["project_id"]
     return next((x for x in project_state(pid)["tasks"] if x["id"] == tid), None)
 
@@ -3868,6 +3925,34 @@ def _hm(sec):
 DEAD_WHY = {"process": "宿主进程已退出（Codex 关了）",
             "session": "会话已停止写入",
             "heartbeat": "长时间没有心跳"}
+
+
+def member_by_thread(thread_id):
+    """会话 → 工位。子代理动手前的第一道查询：这条会话在不在看板上。
+
+    只查一次库，不重算 project_state：钩子跑在每次工具调用前，慢一点就是全站变卡。
+    """
+    tid = (thread_id or "").strip()
+    if not tid:
+        return None
+    with db() as c:
+        m = c.execute("SELECT * FROM members WHERE thread_id=? ORDER BY created_at DESC LIMIT 1",
+                      (tid,)).fetchone()
+        if not m:
+            return None
+        p = c.execute("SELECT id,name,goal FROM projects WHERE id=?",
+                      (m["project_id"],)).fetchone()
+        doing = c.execute("SELECT id,title,progress FROM tasks WHERE assignee_id=? AND status='doing'"
+                          " ORDER BY updated_at DESC", (m["id"],)).fetchall()
+    mm = dict(m)
+    return {"project": dict(p) if p else None,
+            "member": {"id": mm["id"], "name": mm.get("name") or "",
+                       "role": mm.get("role") or "",
+                       "is_lead": bool(mm.get("is_lead")),
+                       "state": mm.get("state") or "",
+                       "seat_no": mm.get("seat_no") or 0,
+                       "beat_at": mm.get("beat_at") or 0},
+            "doing": [dict(r) for r in doing]}
 
 
 def project_health(pid, st=None):
@@ -4005,6 +4090,9 @@ def resume_brief(pid):
                     "task_id": t["id"], "title": t["title"],
                     "assignee": m["name"], "seat": m.get("seat_label") or "",
                     "progress": safe_int(t.get("progress"), 0, 0, 100),
+                    # 断点：接手的人第一眼要看到「上一个人做到哪了」
+                    "checkpoint": (t["checkpoint"] if "checkpoint" in t.keys() else "") or "",
+                    "checkpoint_at": (t["checkpoint_at"] if "checkpoint_at" in t.keys() else 0) or 0,
                     "idle_sec": idle_of.get(t["id"], 0),
                     "idle_human": _hm(idle_of.get(t["id"], 0)),
                     "why": DEAD_WHY.get(m.get("dead_reason"), "状态不明"),
@@ -4619,6 +4707,11 @@ class Handler(BaseHTTPRequestHandler):
         if m:
             r = resume_brief(m.group(1))
             return self._send(200 if r else 404, r or {"error": "no such project"})
+        m = re.fullmatch(r"/api/threads/([\w-]+)", p)
+        if m:
+            r = member_by_thread(m.group(1))
+            # 没登记的会话返回 found=false，不返回 404：钩子要能用「查不到」当放行条件
+            return self._send(200, r and dict(r, found=True) or {"found": False})
         m = re.fullmatch(r"/api/projects/([\w]+)/health", p)
         if m:
             r = project_health(m.group(1))

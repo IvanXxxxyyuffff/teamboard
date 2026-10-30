@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.3.16 — never start over
+
+A task that is half done is an asset, and restarting it from zero throws that asset away. Three
+things now make that impossible to do quietly.
+
+**Checkpoints.** Tasks carry `checkpoint` / `checkpoint_at`: where the last run stopped, which
+paths are already ruled out, what comes next.
+
+**A resume note is required.** Re-opening a task that already has progress or a checkpoint —
+whether it is the same member coming back or a different one taking over — returns 400
+`need_resume_note` until the caller writes what they reviewed. The note becomes the new checkpoint.
+
+**Progress only moves up.** Dropping it requires `confirm_restart=true` plus a `restart_reason`,
+and the restart is logged as an event (`from`, `to`, `why`) so "who decided to throw the work away"
+is answerable later.
+
+**Host-level gate (optional, recommended).** `hooks/pretooluse.py` runs before Bash / apply_patch:
+it asks the board whether this session is a seat and whether that seat holds a task. Unregistered
+work is refused with the exact `update_task(...)` call. The lead, unknown sessions, non-work tools
+and any error pass through — a broken gate must never brick the app. See README for the hooks.json
+snippet; Codex asks you to trust the hook once.
+
+Tests: half-done restart without note 400 → with note 200 and checkpoint stored; progress rollback
+400 → documented restart 200; `/api/threads/<tid>` resolves a seat and answers `found=false`
+otherwise.
+
 ## 0.3.15 — "continue" is not "carry on"
 
 Quit the app mid-task and come back: the `doing` rows are still there, but the agents behind them

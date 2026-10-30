@@ -2412,6 +2412,8 @@ function openDetail(id){
         ${h.note?`<div class="hn">${esc(h.note)}</div>`:""}
         ${h.dupe_of?`<div class="hn" style="color:var(--coral)">↺ 与已证伪的 ${esc(h.dupe_of)} 重复，别重跑</div>`:""}
       </div>`).join("")}</div></div>`:""}
+    ${t.checkpoint?`<div class="field"><label>断点（上一次做到哪）</label>
+      <div class="dtext">${esc(t.checkpoint)}</div></div>`:""}
     <div class="field"><label>说明</label><div class="dtext">${esc(t.detail||"—")}</div></div>
     <div class="field"><label>工时</label><div class="timebox" id="f-time"><span class="muted">读取中…</span></div></div>
     <div class="foot"><span class="ro-note">只读视图 · 要改任务找项目总监</span>

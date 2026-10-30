@@ -118,8 +118,10 @@ def main():
         check("a finished task with a command is not counted as evidence-less",
               okv["id"] not in [t["id"] for t in st2["tasks"] if not t.get("verify_cmd")],
               st2.get("done_without_evidence"))
-        # 回滚成 doing，后面的测试还要用它
-        call(base, "PATCH", f"/api/tasks/{task['id']}", {"status": "backlog", "progress": 0})
+        # 回滚成 backlog，后面的测试还要用它。回退进度＝重做，按规矩写理由（并记事件）
+        call(base, "PATCH", f"/api/tasks/{task['id']}",
+             {"status": "backlog", "progress": 0, "confirm_restart": True,
+              "restart_reason": "测试用例回滚，供后续断言复用"})
 
         # 编制冻结：批准单只能用一次、人名/岗位不能直接改
         code, reuse = call(base, "POST", f"/api/projects/{pid}/members",
@@ -483,6 +485,43 @@ def main():
         code, freed5 = call(base, "PATCH", f"/api/tasks/{t5['id']}",
                             {"status": "doing", "assignee_id": w3["id"]})
         check("reconciling the leftover opens the resume gate", code == 200, freed5)
+
+        # 断点：已经做过的活不许从头再来。接管/重启必须先复盘，进度只能往上。
+        code, t7 = call(base, "POST", f"/api/projects/{pid3}/tasks",
+                        {"title": "带断点的活", "assignee": w3["id"], "estimate": 2,
+                         "milestone": "M1", "deliverable": str(doc), "dod": "x"})
+        call(base, "PATCH", f"/api/tasks/{t7['id']}", {"progress": 40})
+        code, need_note = call(base, "PATCH", f"/api/tasks/{t7['id']}",
+                               {"status": "doing", "assignee_id": w3["id"]})
+        check("a half-done task cannot be restarted without a resume note",
+              code in (400, 403) and need_note.get("need_resume_note"), need_note)
+        note = "读完 a.md：接口已对接完，下一步跑 e2e"
+        code, with_note = call(base, "PATCH", f"/api/tasks/{t7['id']}",
+                               {"status": "doing", "assignee_id": w3["id"],
+                                "resume_note": note})
+        check("a resume note opens it and lands in the checkpoint",
+              code == 200 and (with_note.get("checkpoint") or "") == note, with_note.get("checkpoint"))
+        code, back = call(base, "PATCH", f"/api/tasks/{t7['id']}", {"progress": 10})
+        check("progress may not go backwards without an explicit restart",
+              code in (400, 403) and back.get("need_confirm_restart"), back)
+        code, no_reason = call(base, "PATCH", f"/api/tasks/{t7['id']}",
+                               {"progress": 10, "confirm_restart": True})
+        check("a restart must say why", code >= 400 and no_reason.get("field") == "restart_reason",
+              no_reason)
+        code, restarted = call(base, "PATCH", f"/api/tasks/{t7['id']}",
+                               {"progress": 10, "confirm_restart": True,
+                                "restart_reason": "接口换了，前 40% 作废"})
+        check("a documented restart is allowed", code == 200 and restarted.get("progress") == 10,
+              restarted.get("progress"))
+
+        # 钩子用的查询：会话 → 工位。返回 found=false 时钩子放行，不能 404。
+        code, th = call(base, "GET", "/api/threads/01a2b3c4-9999-7222-8333-444455556666")
+        check("a bound thread resolves to its seat",
+              code == 200 and th.get("found") and (th.get("member") or {}).get("name") == "工程甲",
+              th)
+        code, th2 = call(base, "GET", "/api/threads/ffffffff-0000-0000-0000-000000000000")
+        check("an unknown thread answers found=false instead of 404",
+              code == 200 and th2.get("found") is False, th2)
 
         # 交付面最硬的一条：没进过 doing 的任务不许标完成。
         # 「写完了」不等于「做完了」——没有执行记录，就没有任何人在它上面跑过。

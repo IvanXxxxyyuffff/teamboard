@@ -134,3 +134,31 @@ python3 scripts/sync_version.py      # rewrites both plugin.json files from VERS
 - `docs/REVIEW-*.md` is not shipped; known P2 issues are listed in `docs/ROADMAP.md`.
 
 MIT licensed. PRs welcome.
+
+## Optional: block "work first, report later" at the host layer
+
+The board can only judge what it is told. A member that never calls the plugin can still read code
+and run commands — the ledger stays empty. Codex fires a `PreToolUse` hook *before* a tool runs,
+which is the only place to catch that.
+
+`plugins/teamboard/hooks/pretooluse.py` answers one question per command: **is this session a seat
+on the board, and does it hold a task right now?** Members without an in-progress task are refused,
+with the exact `update_task(...)` call they need. The lead, unregistered sessions, non-work tools
+and any error are let through — a broken gate must never brick the app.
+
+Register it once in `~/.codex/hooks.json` (Codex will ask you to trust it):
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      { "matcher": "Bash",
+        "hooks": [{ "type": "command",
+                    "command": "python3 /absolute/path/to/plugins/teamboard/hooks/pretooluse.py" }] },
+      { "matcher": "apply_patch",
+        "hooks": [{ "type": "command",
+                    "command": "python3 /absolute/path/to/plugins/teamboard/hooks/pretooluse.py" }] }
+    ]
+  }
+}
+```

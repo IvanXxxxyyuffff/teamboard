@@ -315,6 +315,27 @@ spawn 时 `on:true`，收工 `on:false`。它决定面板显示「工作中」�
 **没有静音开关**：不存在 ack/mute 接口，唯一让它变短的办法是把事做掉。
 自驱心跳的 prompt 第 0 步就是「清空 nudge」——醒来先看这张单子，再谈别的。
 
+## 断点续跑：不许从头来
+
+任务被中断（软件退出、换人接手）后，「重开一遍」是这类项目里最贵的浪费：13 小时的活重做一遍，
+等于团队凭空少一半人。所以三件事写死在服务端：
+
+| 规则 | 触发 | 返回 |
+|---|---|---|
+| 复盘才能开工 | 任务已有 `progress>0` 或断点，重新 `doing` / 换负责人 | 400 `need_resume_note`（带 `checkpoint` 原文） |
+| 断点留档 | 任何一次带 `resume_note` 的更新 | 写进 `checkpoint` + `checkpoint_at`，面板任务详情可见 |
+| 进度只能往上 | 进度回退 | 400 `need_confirm_restart`；带 `confirm_restart=true` + `restart_reason` 才放行，并记 `task.restart` 事件 |
+
+`resume_note` 写什么：**做到哪、哪条路已经排除、下一步是什么**。它是给下一个接手的人看的，
+不是给自己看的。看板的「断点」字段就是它的存档。
+
+### 宿主层钩子（可选，强烈建议）
+
+插件管得住交付，管不住「先干两小时再说」。Codex 的 `PreToolUse` 钩子跑在工具执行之前：
+`hooks/pretooluse.py` 会先问看板「这条会话挂号了吗」——没挂号就拦下，并给出该调的
+`update_task(status='doing', assignee_id=...)`。总监、未登记会话、非动手类工具、任何异常全部放行。
+注册方式见开源仓 README（Codex 会要求你信任这个 hook 一次）。
+
 ## 进度与停滞
 
 - 总进度按 `estimate` 加权，不是任务数平均：新增 backlog 不会让进度倒退。

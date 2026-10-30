@@ -205,10 +205,13 @@ def _resume_line(st):
     if not r.get("pending"):
         return ""
     ghost = r.get("ghost") or []
-    who = "、".join(f"{g['name']}·{g['task'][:14]}" for g in ghost[:3])
+    who = "、".join(
+        f"{g['name']}·{g['task'][:14]}（做到 {g.get('progress') or 0}%）" for g in ghost[:3])
     return (f"🔁 续跑未对齐：上次运行留下 {len(ghost)} 条 doing 任务，主人已停（{who}）。"
             f"先 resume_brief 逐条处置（收回 backlog / 转给活人 / 重开子代理 + bind_member / 转 blocked），"
-            f"处置完才允许派新活——否则 update_task(status='doing') 会被 403 (need_resume)。")
+            f"处置完才允许派新活——否则 update_task(status='doing') 会被 403 (need_resume)。"
+            f"接手的人必须先复盘上一段做到哪（读 checkpoint / 产物 / 日志），写 resume_note 再继续，"
+            f"**不许从 0 重来**：进度回退会被拒（need_confirm_restart）。")
 
 
 def _nudge_line(st):
