@@ -2019,6 +2019,34 @@ def align_gate(pid):
             ]}
 
 
+def resume_gate(pid):
+    """续跑闸：上次运行留下 doing、人已经不在了 → 先对齐，再派新活。
+
+    Codex 一退出，子代理全停，但库里还留着 doing。用户回来说一句「继续」，
+    如果总监直接派新活，新任务就叠在旧账上：进度在涨、账是空的，越做越像。
+    所以这条闸只拦「开新活」（backlog → doing），放开全部处置动作：
+    resume_brief / 收回 backlog / 换活人 / spawn+bind / 转 blocked。
+    """
+    st = project_state(pid)
+    if not st:
+        return None
+    r = st.get("resume") or {}
+    ghost = r.get("ghost") or []
+    if not ghost:
+        return None
+    names = "、".join(f"{g['name']}·{g['task'][:14]}({g['human']})" for g in ghost[:4])
+    return {"error": f"先对齐再派活：上次运行留下 {len(ghost)} 条 doing 任务，主人已经不在跑——"
+                     f"{names}。先 resume_brief，再逐条处置（收回 backlog / 转给活人 / "
+                     f"重开子代理 + bind_member / 转 blocked），处置完这条闸才放行。",
+            "need_resume": True, "ghost": ghost,
+            "next_actions": [
+                "GET  /api/projects/<pid>/resume-brief  → 看谁断了、哪条烂尾",
+                "PATCH /api/tasks/<tid>  {status:'backlog'}  → 收回",
+                "PATCH /api/tasks/<tid>  {status:'doing', assignee_id:<mid>}  → 转给活人",
+                "POST /api/projects/<pid>/members/<mid>/bind  {thread_id:'<全 UUID>'}  → 新会话接管同一工位",
+            ]}
+
+
 def autopilot_prompt(pid, name):
     """自驱心跳的 prompt。写成模板，不写死某个项目——开源后别人拉起团队也能直接用。"""
     return (
@@ -3007,7 +3035,16 @@ def project_state(pid):
                        "not_working": len([m for m in members if m["state"] != "working"]),
                        "total": len(members),
                        "gap_sec": int(now - last_any) if last_any > 0 else -1,
-                       "needs_reconcile": bool(orphans)},
+                       "needs_reconcile": bool(orphans),
+                       # 续跑：软件退出后「继续」不等于「接着干」。还挂着 doing 的人已经
+                       # 不在了，这时候直接派新活，等于把新任务叠在一张空账上——进度会涨，
+                       # 但每一格都是假的。所以在烂尾清掉之前，派活一律 403（resume_gate）。
+                       "pending": bool(align_ghost),
+                       "ghost": align_ghost,
+                       "human": _hm(int(now - last_any)) if last_any > 0 else "",
+                       "must": ((f"上次运行留下 {len(align_ghost)} 条 doing 任务，主人已经不在跑："
+                                 "先 resume_brief，再逐条处置（收回 backlog / 重开子代理 + bind_member "
+                                 "/ 转 blocked）；处置完这条闸才放行派活") if align_ghost else "")},
             # 配比：总监填的配额 + 实际切出来的条数。看板顶部照这个显示，别让「全 P1」复发
             "priority_ratio": prio_ratio,
             "priority_quota": {"p1": q1, "p2": q12 - q1, "p3": len(open_tasks) - q12},
@@ -3524,6 +3561,15 @@ def check_links(c, pid, assignee_id, depends_on):
 def add_task(pid, b):
     tid = new_id("task")
     status = b.get("status", "backlog")
+    # 兼容写法：assignee 传成员 id 或姓名，一律归一成 assignee_id。
+    # 不归一的话，同一件事有两个字段名，闸只认其中一个——那等于没闸。
+    if not (b.get("assignee_id") or "").strip() and (b.get("assignee") or "").strip():
+        with db() as c0:
+            row = c0.execute("SELECT id FROM members WHERE project_id=? AND (id=? OR name=?)"
+                             " ORDER BY is_lead LIMIT 1",
+                             (pid, b["assignee"], b["assignee"])).fetchone()
+        if row:
+            b["assignee_id"] = row["id"]
     if status not in COLUMNS:
         return {"error": f"status must be one of {COLUMNS}"}
     # 不能「建成即完成」：绕开 doing 就没有执行记录、没有证据校验，
@@ -3537,6 +3583,13 @@ def add_task(pid, b):
         gate = ack_gate(pid)
         if gate:
             return gate
+        # 续跑：上次运行留下的烂尾还没处置，不许再开新活（否则新任务叠在空账上）
+        gate = resume_gate(pid)
+        if gate:
+            return gate
+        if not (b.get("assignee_id") or "").strip():
+            return {"error": "建成 doing 必须带 assignee_id：没有主的在办任务，谁也追不到。",
+                    "field": "assignee_id", "need_assignee": True}
         dep = (b.get("depends_on") or "").strip()
         if dep:
             with db() as c1:
@@ -3603,6 +3656,16 @@ def update_task(tid, b):
             gate = ack_gate(t["project_id"])
             if gate:
                 return gate
+            # 续跑闸只拦「开新活」：上次运行留下的 doing 还没处置完，就别往上叠新任务
+            if b["status"] == "doing":
+                gate = resume_gate(t["project_id"])
+                if gate:
+                    return gate
+                if not ((b.get("assignee_id") or "").strip()
+                        or (t["assignee_id"] or "").strip()):
+                    return {"error": "派活必须带 assignee_id：没有主的 doing 任务，"
+                                     "看板上就是一条没人负责的活。",
+                            "field": "assignee_id", "need_assignee": True}
         # 字段归一：脏数据不入库
         for k in ("progress", "priority"):
             if k in b:

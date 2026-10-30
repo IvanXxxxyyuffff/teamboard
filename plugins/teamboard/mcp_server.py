@@ -195,6 +195,22 @@ def _need_ack_line(st):
             f"id='{first['id']}')。不回执：改状态/新计划/导报告全被 403。")
 
 
+def _resume_line(st):
+    """续跑：软件退出过、回来只会说一句「继续」。
+
+    上一次运行留下的 doing 还挂着，人已经不在了。这时如果直接派新活，
+    新任务就叠在旧账上——所以先把这句话顶到最前面：先对齐，再安排。
+    """
+    r = st.get("resume") or {}
+    if not r.get("pending"):
+        return ""
+    ghost = r.get("ghost") or []
+    who = "、".join(f"{g['name']}·{g['task'][:14]}" for g in ghost[:3])
+    return (f"🔁 续跑未对齐：上次运行留下 {len(ghost)} 条 doing 任务，主人已停（{who}）。"
+            f"先 resume_brief 逐条处置（收回 backlog / 转给活人 / 重开子代理 + bind_member / 转 blocked），"
+            f"处置完才允许派新活——否则 update_task(status='doing') 会被 403 (need_resume)。")
+
+
 def _nudge_line(st):
     """催办：这一刻必须有人做的事。
 
@@ -253,7 +269,7 @@ def _augment(name, args, text, sc):
         sc = dict(sc)
         sc["pending"] = cards
     # 顺序是刻意的：先催办（现在该谁动手），再欠回执（用户已经拍了板，还没回话）。
-    head = "\n\n".join(filter(None, [_nudge_line(st), _need_ack_line(st)]))
+    head = "\n\n".join(filter(None, [_resume_line(st), _nudge_line(st), _need_ack_line(st)]))
     if head:
         text = head + "\n\n" + (text or "")
     return text, sc
@@ -265,6 +281,8 @@ def summarize(p):
     lines = [f"# {p['name']}　{s['overall']}%",
              # 欠回执必须排在「有没有人在干活」之前：它是这一轮的起点。
              _need_ack_line(st),
+             # 续跑：重启后第一句「继续」必须先对齐，再安排
+             _resume_line(st),
              # 催办：不是描述现状，是「现在该谁做什么」。排在所有统计数字前面。
              _nudge_line(st),
              # 第一句永远是「有没有人在干活」。

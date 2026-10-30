@@ -276,7 +276,7 @@ spawn 时 `on:true`，收工 `on:false`。它决定面板显示「工作中」�
 
 可选：`priority`、`estimate`（加权进度用）、`resource`、`evidence`。
 
-## 七个硬闸
+## 八个硬闸
 
 1. **交付物存在性**：`deliverable` 支持 `a|b`、`a + b`、`{X,Y}.md`、通配符；
    相对路径按 `project.workdir` 解析。一个文件都不存在时，`status=done` 会被拒绝（400）。
@@ -294,6 +294,7 @@ spawn 时 `on:true`，收工 `on:false`。它决定面板显示「工作中」�
    没有 `task_sessions` 记录、`time_spent=0`、`doing_since=0`，就说明没人在这条任务上跑过，
    「写完了」不等于「做完了」。任务**不能建成 `done`**，建成 `doing` 也要过 `ack_gate`
    与依赖顺序。合法路径只有一条：派人 → 挂 `doing` → 真跑 → 带证据 `PATCH status=done`。
+8. **续跑**：上次运行留下的 `doing` 任务主人已经不在了 → 派新活 403 `need_resume`。「继续」不等于「接着干」：先 `resume_brief`，把烂尾逐条处置（收回 backlog / 转给活人 / 重开子代理 + `bind_member` / 转 blocked），处置完闸自动放行。另外 `doing` 必须有 `assignee_id`，没有主在办任务一律 400 `need_assignee`。
 
 ## 催办（nudge）：插件必须自己开口
 

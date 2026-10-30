@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.15 — "continue" is not "carry on"
+
+Quit the app mid-task and come back: the `doing` rows are still there, but the agents behind them
+are gone. Saying "continue" and immediately assigning new work stacks fresh tasks on an empty
+ledger — progress climbs, every cell of it fiction. `PATCH status=doing` on a task that is not
+already in progress now returns 403 `need_resume` while any leftover `doing` has a stopped owner.
+
+The way out is the repair itself, not an acknowledgement: `resume_brief`, then reclaim to
+`backlog` / hand it to a live member / respawn + `bind_member` / mark `blocked`. Clear the
+leftovers and the gate opens by itself.
+
+Also enforced: a task cannot enter `doing` without an owner (`need_assignee`) — an unowned
+in-progress task cannot be chased by anyone, so it is just a row that looks busy. And `add_task`
+now accepts `assignee` (member id or name) as an alias for `assignee_id`, so the gate cannot be
+sidestepped by using the other spelling.
+
+MCP: every tool result opens with `🔁 续跑未对齐` while leftovers exist.
+
+Tests: backdate a `doing` task with a stopped owner → `resume.pending` → new work 403 → reclaim →
+allowed; unowned `doing` refused.
+
 ## 0.3.14 — the board has to speak first
 
 Gates only bite when someone reaches for them. A director who never looks at the board simply

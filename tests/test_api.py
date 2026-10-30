@@ -452,6 +452,38 @@ def main():
         check("an acknowledged decision is not re-counted",
               not (st6.get("need_ack") or []), st6.get("need_ack"))
 
+        # 续跑：软件退出后用户只会说一句「继续」。上次留下的 doing 人已经不在了，
+        # 这时直接派新活就是把新任务叠在一张空账上——必须先对齐，不能绕过。
+        con = sqlite3.connect(str(home / "board.db"))
+        old_iso2 = (datetime.now(timezone.utc).astimezone() - timedelta(minutes=20)
+                    ).isoformat(timespec="seconds")
+        con.execute("UPDATE tasks SET updated_at=? WHERE id=?", (old_iso2, t3["id"]))
+        con.commit()
+        con.close()
+        code, st7 = call(base, "GET", f"/api/projects/{pid3}")
+        rp = st7.get("resume") or {}
+        check("a leftover doing task makes the resume gate pending",
+              rp.get("pending") is True and bool(rp.get("ghost")), rp)
+        code, t5 = call(base, "POST", f"/api/projects/{pid3}/tasks",
+                        {"title": "重启后想直接派的新活", "assignee": w3["id"], "estimate": 1,
+                         "milestone": "M1", "deliverable": str(doc), "dod": "x"})
+        code, blocked_resume = call(base, "PATCH", f"/api/tasks/{t5['id']}",
+                                    {"status": "doing", "assignee_id": w3["id"]})
+        check("new work is refused until the leftovers are reconciled",
+              code in (400, 403) and blocked_resume.get("need_resume"), blocked_resume)
+        # 处置：把烂尾收回 backlog 就算对齐，闸立刻放行
+        call(base, "PATCH", f"/api/tasks/{t3['id']}", {"status": "backlog"})
+        # 派活必须有主：没有 assignee 的 doing，谁也没法追
+        code, t6 = call(base, "POST", f"/api/projects/{pid3}/tasks",
+                        {"title": "没有主的活", "estimate": 1,
+                         "milestone": "M1", "deliverable": str(doc), "dod": "x"})
+        code, no_owner = call(base, "PATCH", f"/api/tasks/{t6['id']}", {"status": "doing"})
+        check("starting a task without an owner is refused",
+              code in (400, 403) and no_owner.get("need_assignee"), no_owner)
+        code, freed5 = call(base, "PATCH", f"/api/tasks/{t5['id']}",
+                            {"status": "doing", "assignee_id": w3["id"]})
+        check("reconciling the leftover opens the resume gate", code == 200, freed5)
+
         # 交付面最硬的一条：没进过 doing 的任务不许标完成。
         # 「写完了」不等于「做完了」——没有执行记录，就没有任何人在它上面跑过。
         code, t4 = call(base, "POST", f"/api/projects/{pid3}/tasks",
