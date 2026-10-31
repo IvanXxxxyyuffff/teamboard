@@ -581,6 +581,7 @@ def main():
         call(base, "PATCH", f"/api/tasks/{sp['id']}", {"status": "doing", "assignee_id": mid0})
         code, st3 = call(base, "GET", f"/api/projects/{pid}")
         row = next((t for t in st3["tasks"] if t["id"] == sp["id"]), {})
+        check("pace_min is stored as given", row.get("pace_min") == 1, row.get("pace_min"))
         check("a doing task whose deliverable stopped moving is flagged spinning",
               row.get("spinning") is True, row.get("write_age_sec"))
         check("spin shows up in nudge",

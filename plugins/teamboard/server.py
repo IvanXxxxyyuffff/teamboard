@@ -4094,8 +4094,9 @@ def add_task(pid, b):
                        (pid,)).fetchone()[0]
         c.execute("""INSERT INTO tasks(id,project_id,title,detail,role,assignee_id,status,priority,
                      sort_order,deliverable,dod,depends_on,estimate,progress,blocked_reason,
-                     created_at,updated_at,delivered_at,milestone,resource,evidence,doing_since)
-                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     created_at,updated_at,delivered_at,milestone,resource,evidence,doing_since,
+                     pace_min)
+                     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                   (tid, pid, b.get("title") or "未命名任务", b.get("detail", ""),
                    cn_role(b.get("role", "")), b.get("assignee_id") or None, status,
                    safe_int(b.get("priority", 2), 2, 1, 3), mx + 100, b.get("deliverable", ""),
@@ -4103,7 +4104,8 @@ def add_task(pid, b):
                    prog, b.get("blocked_reason", ""), now_iso(), now_iso(),
                    now_iso() if status == "done" else "", b.get("milestone", ""),
                    b.get("resource", ""), b.get("evidence", "") if b.get("evidence") in EVIDENCE else "",
-                   time.time() if status == "doing" else 0))
+                   time.time() if status == "doing" else 0,
+                   safe_int(b.get("pace_min", 20), 20, 0, 600)))
         log_event(c, pid, "task.created", actor=b.get("assignee_id", ""), task_id=tid,
                   payload=b.get("title", ""))
         if status == "doing":
@@ -4890,7 +4892,9 @@ def heartbeat_project(pid, b):
             if tgt and mt > 0:
                 c.execute("UPDATE members SET last_write_path=?, last_write_mtime=?,"
                           " last_write_bytes=? WHERE id=?", (rel, mt, sz, tgt))
-                lw = {"path": rel, "age_sec": 0, "bytes": sz, "producing": True}
+                _age = max(0, int(ts - mt))
+                lw = {"path": rel, "age_sec": _age, "bytes": sz,
+                      "producing": _age <= PRODUCING_SEC}
             elif spec.strip():
                 lw = {"path": spec, "missing": True}
     out = {"ok": True, "project_id": pid, "touched": hit,
