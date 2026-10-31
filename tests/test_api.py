@@ -110,10 +110,12 @@ def main():
               code >= 400 and noev.get("field") == "verify_cmd", noev)
         code, okv = call(base, "PATCH", f"/api/tasks/{task['id']}",
                          {"status": "done", "progress": 100, "evidence": "observed",
-                          "evidence_path": str(doc), "verify_cmd": "curl -s localhost/x",
+                          "evidence_path": str(doc), "verify_cmd": "true",
                           "verify_out": "200\nOK"})
         check("done with verify_cmd lands and stamps verified_at",
               code == 200 and okv.get("verify_cmd") and okv.get("verified_at"), okv)
+        check("done re-runs verify_cmd itself (evidence is generated, not claimed)",
+              okv.get("verify_out") is not None, okv.get("verify_out"))
         code, st2 = call(base, "GET", f"/api/projects/{pid}")
         check("a finished task with a command is not counted as evidence-less",
               okv["id"] not in [t["id"] for t in st2["tasks"] if not t.get("verify_cmd")],
@@ -562,6 +564,35 @@ def main():
         by = {x["id"]: x for x in (ran.get("results") or [])}
         check("run_criteria: exit 0 → green", by.get("c_ok", {}).get("status") == "green", ran)
         check("run_criteria: exit 1 → red", by.get("c_bad", {}).get("status") == "red", ran)
+
+        # 落盘指纹：心跳带 path，服务端自己 stat 出真实 mtime（不采信自报）
+        code, stx = call(base, "GET", f"/api/projects/{pid}")
+        mid0 = stx["members"][0]["id"]
+        code, hb = call(base, "POST", f"/api/members/{mid0}/heartbeat", {"path": str(doc)})
+        check("heartbeat records a write fingerprint",
+              code in (200, 201) and (hb.get("last_write") or {}).get("age_sec") is not None, hb)
+
+        # 空转：pace_min=1 且交付物一小时没动 → spinning + nudge
+        old = time.time() - 3600
+        os.utime(doc, (old, old))
+        code, sp = call(base, "POST", f"/api/projects/{pid}/tasks",
+                        {"title": "空转检测", "assignee": mid0, "estimate": 1, "pace_min": 1,
+                         "deliverable": str(doc), "milestone": "M1", "dod": "x"})
+        call(base, "PATCH", f"/api/tasks/{sp['id']}", {"status": "doing", "assignee_id": mid0})
+        code, st3 = call(base, "GET", f"/api/projects/{pid}")
+        row = next((t for t in st3["tasks"] if t["id"] == sp["id"]), {})
+        check("a doing task whose deliverable stopped moving is flagged spinning",
+              row.get("spinning") is True, row.get("write_age_sec"))
+        check("spin shows up in nudge",
+              any(i.get("kind") == "spin" for i in (st3["nudge"]["items"] or [])),
+              [i.get("kind") for i in (st3["nudge"]["items"] or [])])
+
+        # 插件自己跑 verify_cmd：跑不过就不许标完成
+        code, bad_verify = call(base, "PATCH", f"/api/tasks/{sp['id']}",
+                                {"status": "done", "progress": 100, "evidence": "observed",
+                                 "evidence_path": str(doc), "verify_cmd": "false"})
+        check("done is rejected when the verify command fails",
+              code >= 400 and bad_verify.get("need_verify_pass"), bad_verify)
     finally:
         kill_board(base)
         try:

@@ -131,6 +131,21 @@ def _idle_line(st):
             f"手里未收工 {i.get('open_tasks')} 条")
 
 
+def _write_line(st):
+    """「有没有东西真的落到磁盘上」。进程活着、任务进行中，都可能一字节没写。"""
+    w = st.get("writing") or {}
+    if not w.get("tracked"):
+        return ""
+    if not w.get("spinning") and not w.get("no_fingerprint"):
+        return f"落盘：{w.get('producing', 0)}/{w['tracked']} 条在产出 ✅"
+    spin = [t for t in (st.get("tasks") or []) if t.get("spinning")][:2]
+    detail = "；".join(
+        f"{t['title'][:14]}（{int((t.get('write_age_sec') or 0) / 60)} 分钟没动）"
+        for t in spin) or f"{w.get('no_fingerprint')} 条还没有落盘指纹"
+    return (f"⚠ 空转：{detail}。超过自定节奏没落盘，「进行中」不算进展——"
+            "先 ls -la 核实产物，再决定交中间产物 / 改派 / 转 blocked")
+
+
 def _align_line(st):
     """「在跑的人挂的是哪一条」。idle 绿了也可能整队都在账外干活。"""
     a = st.get("align") or {}
@@ -280,10 +295,10 @@ def _augment(name, args, text, sc):
 
 _TASK_KEEP = ("id", "title", "status", "priority", "assignee_id", "progress",
               "eta_left", "depends_on", "resource", "blocked_reason", "checkpoint",
-              "deliverable", "due_at")
+              "deliverable", "due_at", "pace_min", "spinning", "write_age_sec")
 _MEMBER_KEEP = ("id", "name", "seat_no", "role", "state", "turn", "state_source",
                 "load", "capacity", "current_task", "agent_leaf", "model", "effort",
-                "session_silent", "away_for")
+                "session_silent", "away_for", "producing", "last_write", "spawn_hint")
 
 
 def compact_overview(d):
@@ -414,6 +429,7 @@ def summarize(p):
              # 放在排期/进度前面是故意的：这两个数字都能在自己埋头干的时候慢慢变好，
              # 只有 idles 不会。总监最容易漏掉的就是这一行。
              _idle_line(st),
+             _write_line(st),
              _align_line(st),
              _board_line(st),
              _autopilot_line(st),
@@ -560,6 +576,7 @@ TOOLS = [
          "priority": {"type": "integer", "minimum": 1, "maximum": 3},
          "deliverable": {"type": "string"}, "dod": {"type": "string"},
          "estimate": {"type": "number", "description": "用时规划，人时，>0（必填）"},
+         "pace_min": {"type": "integer", "description": "落盘节奏（分钟）：每 N 分钟必须有一次文件变动，看板按它判空转。产文件的活填 15~30；纯分析/等设备填 0（必填，不写就不派）"},
          "milestone": {"type": "string", "description": "阶段"},
          "depends_on_title": {"type": "string", "description": "前置任务标题，无则空字符串"}},
      "required": ["title", "assignee", "estimate"]}},
@@ -596,6 +613,8 @@ TOOLS = [
          "evidence": {"type": "string", "enum": ["observed", "inferred", "assumed"],
                       "description": "证据等级；inferred 不能 ≥90%"},
          "estimate": {"type": "number", "description": "工作量（人时）。排期和倒计时都靠它：estimate 就是这条任务的时间预算"},
+         "pace_min": {"type": "integer", "description": "落盘节奏（分钟）：超过 N 分钟交付物没变就算空转；0=不产文件的任务"},
+         "verify_timeout": {"type": "integer", "description": "标 done 时插件自动跑 verify_cmd 的超时秒数，默认 120，上限 600"},
          "paused": {"type": "boolean", "description": "true=暂停计时（等设备/等审批），false=恢复；暂停期间墙钟不算工时"},
          "evidence_path": {"type": "string", "description": "证据文件/目录，置 done 必填且必须真实存在"},
          "verify_cmd": {"type": "string",
@@ -648,7 +667,8 @@ TOOLS = [
          "project": {"type": "string"},
          "member": {"type": "string", "description": "员工姓名、工位号（如 3）或 id"},
          "thread_id": {"type": "string", "description": "新子代理的 threadId（UUID）"},
-         "reason": {"type": "string", "description": "为什么换会话，如「上个会话结束，重开一个接着干」"}},
+         "reason": {"type": "string", "description": "为什么换会话，如「上个会话结束，重开一个接着干」"},
+         "force": {"type": "boolean", "description": "旧会话还在跑时默认拒绝接管（先 followup/send_input 复用它）；确认要换执行体才传 true"}},
       "required": ["member", "thread_id"]}},
     {"name": "request_staff_change", "description": "申请加人 / 换人 / 撤编。编制是固定的：想在编制外动人，必须先提这张申请，用户在会话里批准后才生效。add=加人，replace=换人（工位保留、人换），remove=撤编",
      "inputSchema": {"type": "object", "properties": {
@@ -714,7 +734,10 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "project": {"type": "string"},
          "members": {"type": "array", "items": {"type": "string"},
-                     "description": "成员 id 或姓名；不传＝只刷有 doing 任务的人"}}}},
+                     "description": "成员 id 或姓名；不传＝只刷有 doing 任务的人"},
+         "path": {"type": "string", "description": "这一轮写到哪了：产出文件/目录路径（服务端 stat 真实 mtime，记成落盘指纹）"},
+         "paths": {"type": "array", "items": {"type": "string"},
+                   "description": "多个产出路径；取最新的那个 mtime"}}}},
 ]
 
 
@@ -910,11 +933,20 @@ def call(name, args):
     if name == "heartbeat":
         p = pick_project(args.get("project", ""))
         who = args.get("members") or []
-        r = http("POST", f"/api/projects/{p['id']}/heartbeat",
-                 dict({"members": who} if who else {}, **_host()))
+        body = dict({"members": who} if who else {}, **_host())
+        if args.get("path"):
+            body["path"] = args["path"]
+        if args.get("paths"):
+            body["paths"] = args["paths"]
+        r = http("POST", f"/api/projects/{p['id']}/heartbeat", body)
         n = len(r.get("touched") or [])
         tgt = "有进行中任务的人" if not who else "、".join(who)
         text = f"心跳已刷新：{n} 人（{tgt}）"
+        lw = r.get("last_write") or {}
+        if lw.get("missing"):
+            text += f"\n⚠ 落盘指纹没记上：{lw.get('path')} 不存在"
+        elif lw.get("path"):
+            text += f"\n落盘：{lw['path']}（{lw.get('bytes', 0)} B）"
         if r.get("unknown"):
             text += f"\n未匹配到：{'、'.join(r['unknown'])}"
         return text, r
@@ -972,12 +1004,19 @@ def call(name, args):
 
     if name == "add_task":
         p = pick_project(args.get("project", ""))
+        # 不写落盘节奏就不派：没有它，看板只能看见「进程活着」，看不见「有没有产出」
+        if "pace_min" not in args:
+            raise RuntimeError(
+                "派单必须写 pace_min（落盘节奏）：每多少分钟必须有一次文件变动。"
+                "产文件的活填 15~30；纯分析/等设备填 0。"
+                "没有这个字段，80 分钟的空转和 80 分钟的思考在看板上一模一样。")
         st = http("GET", "/api/projects/" + p["id"])
         body = {"title": args["title"], "role": args.get("role", ""),
                 "status": args.get("status", "backlog"), "priority": int(args.get("priority", 2)),
                 "deliverable": args.get("deliverable", ""), "dod": args.get("dod", ""),
                 "estimate": args.get("estimate"), "milestone": args.get("milestone", ""),
-                "resource": args.get("resource", ""), "evidence": args.get("evidence", "")}
+                "resource": args.get("resource", ""), "evidence": args.get("evidence", ""),
+                "pace_min": int(args.get("pace_min") or 0)}
         if body["estimate"] is None:
             body.pop("estimate")
         who = args.get("assignee", "")
@@ -1138,8 +1177,13 @@ def call(name, args):
         if not hit:
             return f"编制里没有「{ref}」。先看 project_status 确认工位号和姓名。", {"error": "member not found"}
         r = http("POST", f"/api/projects/{p['id']}/members/{hit['id']}/bind",
-                 dict({"thread_id": args["thread_id"], "reason": args.get("reason", "")}, **_host()))
+                 dict({"thread_id": args["thread_id"], "reason": args.get("reason", ""),
+                       "force": bool(args.get("force"))}, **_host()))
         if r.get("error"):
+            if r.get("need_reuse"):
+                return ("⛔ 先复用旧会话，别 spawn 新的：" + r["error"]
+                        + f"\n旧会话 {r.get('old_thread','')[:8]}… 还在跑"
+                          f"（{r.get('old_idle_sec')} 秒前还在写）。"), r
             return "接管失败：" + r["error"], r
         return (f"{hit['seat_label']} {hit['name']} 已接管新会话 {args['thread_id'][:8]}…"
                 f"（第 {r.get('bind_count')} 次，工位不变）。"
@@ -1218,11 +1262,15 @@ def call(name, args):
         body = {k: args[k] for k in ("status", "progress", "blocked_reason", "milestone",
                                      "deliverable", "dod", "resource", "evidence", "estimate",
                                      "paused", "due_at", "evidence_path", "abandoned_reason",
-                                     "verify_cmd", "verify_out")
+                                     "verify_cmd", "verify_out", "pace_min", "verify_timeout")
                 if k in args}
         t = http("PATCH", "/api/tasks/" + target["id"], body)
         if isinstance(t, dict) and t.get("error"):
-            return f"没改成：{t['error']}", t
+            extra = ""
+            if t.get("need_verify_pass"):
+                extra = (f"\n退出码 {t.get('exit')}｜{(t.get('output') or '')[-300:]}"
+                         "\n先修到命令能跑通再来标完成；确实无法用命令验证，带 force=true 并写理由")
+            return f"没改成：{t['error']}{extra}", t
         extra = []
         if t.get("evidence"):
             extra.append(f"证据 {t['evidence']}")

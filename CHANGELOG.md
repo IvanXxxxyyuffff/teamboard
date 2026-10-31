@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.3.25 — watch the file, not the process
+
+The board answered "is the process alive". The useful question is "did anything land on disk".
+A seat can hold a `doing` task, heartbeat on schedule, report 45% — and not have written a byte
+in forty minutes. That is spinning, and it used to look exactly like work.
+
+- **Write fingerprint**: `heartbeat(path=...)` (or `paths=[...]`) makes the server `stat` the
+  deliverable and store the real mtime/size. Self-reported mtimes are not trusted; `producing`
+  means mtime moved within 10 minutes.
+- **Pace per task**: `pace_min` (default 20, `0` = no files expected). A `doing` task whose
+  deliverable has not moved for longer than its pace is flagged `spinning` and pushed to nudge.
+- **Active sweep**: a background loop (default 120 s) stats every `doing` deliverable and writes
+  a `task.spin` event when a task crosses its pace — the board notices idle spinning without
+  anyone asking it to look.
+- **Reuse before spawn**: `bind_member` refuses to hand a seat to a new thread while the old
+  session is still writing (tail event is a tool/thought within 90 s); pass `force=true` to
+  override. Members expose `spawn_hint: reuse|new`.
+- **Verify is executed, not claimed**: marking `done` runs `verify_cmd` itself (timeout 120 s,
+  `verify_timeout` to adjust). Non-zero exit → 400 `need_verify_pass` with the real tail;
+  `verify_out` is overwritten with the actual output.
+- **Granularity nudge**: open tasks estimated over 2 h are surfaced as "split it" — small units
+  mean frequent writes, and frequent writes make spinning visible.
+- Member cards show "落盘 X 前" (last real write) next to utilization; task cards show the
+  `空转` chip. Both are facts, not estimates.
+
 ## 0.3.24 — context budget is part of the interface
 
 Eight items of field feedback from a 10-hour run. The one that costs the most is not a bug:

@@ -22,11 +22,11 @@ description: 当用户问「我的团队现在在做什么 / 项目进度怎么�
 | `propose_plan` | 提交计划（成员 + 任务）给用户审批，批准后自动落库 |
 | `plan_status` | 查审批状态：pending / approved / rejected |
 | `add_member` | 加员工；`model` 字段决定派活时用哪个模型 |
-| `add_task` | 派任务（岗位、负责人、产出、验收标准） |
+| `add_task` | 派任务（岗位、负责人、产出、验收标准）。**`pace_min` 必填**：每 N 分钟必须有一次文件变动（0=不产文件的分析任务），不写不派 |
 | `set_member_model` | 调某员工的模型 + 思考档位（总监专用） |
 | `list_models` | 真实模型与各自支持的档位 |
 | `update_task` | 改状态/进度/阻塞原因 |
-| `heartbeat` | 刷新员工心跳（在岗证明） |
+| `heartbeat` | 刷新员工心跳（在岗证明）。**带 `path`**（这一轮写到哪个文件）→ 服务端 stat 真实 mtime，记成落盘指纹 |
 | `goal_audit` | 目标合规体检：阶段/产出/验收/证据哪里断了 |
 | `member_duty` | 在场租约：spawn 时开、收工时关 |
 | `set_member_thread` | **必做**：把子代理 threadId 绑到成员，面板点成员才能跳会话 |
@@ -44,6 +44,17 @@ description: 当用户问「我的团队现在在做什么 / 项目进度怎么�
 - **不要把工具 JSON 原样贴回对话**，只贴结论和数字。
 - **`progress.stale=true` 时先 `run_criteria`**：几小时前的读数比没有数字更糟。
 - **验收 `cmd` 必须是可执行命令**，不要写「A + B 都要过」这种自然语言。
+
+## 落盘节奏：看板只信 mtime，不信「进行中」
+
+**进程活着 ≠ 在产出。** 一个工位可以挂着 doing、进度 45%、心跳每分钟一次，文件四十分钟没动。
+
+1. **派单必写 `pace_min`**：产文件 15~30；纯分析/等设备填 0。
+2. **每完成一步 `heartbeat(path="<刚写的文件>")`**：服务端 stat，记落盘指纹；自报 mtime 不采信。
+3. **标 done 时插件自己跑 `verify_cmd`**：非 0 退出 → 400 `need_verify_pass`，`verify_out` 用真实回显覆盖；`force=true` 才能跳过。
+4. **复用优先**：旧会话 90 秒内还在写时，`bind_member` 拒绝接管（先 `followup_task`）；确实要换执行体才 `force=true`。
+
+`spinning`（空转）出现时：先 `ls -la <deliverable>` 核实，再决定交中间产物 / 改派 / 转 blocked。
 
 ## 全员停摆（`idle`）与自驱（`autopilot`）——硬规则
 

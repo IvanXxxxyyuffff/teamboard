@@ -1634,6 +1634,7 @@ function card(t){
         title="${t.verify_cmd?`可重跑：${esc(t.verify_cmd)}${t.verified_at?"　验于 "+esc(t.verified_at):""}`:"这条任务标了完成，但没有留下可重跑的命令 —— 无法判断是真验过还是口头说的"}">${t.verify_cmd?"✅ 带证据":"⚠ 无证据"}</span>`:""}
       ${t.resource?`<span class="rchip${t.resource_conflict?" bad":""}">${t.resource_conflict?"⚠ ":""}${esc(t.resource)}</span>`:""}
       ${t.stale_level&&t.stale_level!=="ok"?`<span class="schip ${t.stale_level}">停滞 ${fmtDur(t.stale_sec)}</span>`:""}
+      ${t.spinning?`<span class="schip crit" title="交付物 ${fmtDur(t.write_age_sec)} 没动过（自定落盘节奏 ${t.pace_min} 分钟）">空转 ${fmtDur(t.write_age_sec)}</span>`:""}
       ${t.status!=="done"&&t.eta_at?`<span class="schip eta ${etaCls(t)}"
         title="预计交付 ${hhmm(t.eta_at)}${t.wait_sec?`（排队 ${fmtDur(t.wait_sec)} 后开工）`:""}${t.on_critical?" · 在关键路径上":""}">⏳ ${fmtDur(Math.abs(t.eta_left))}${t.eta_left<0?" 逾期":""}${t.wait_sec>60?" 待开工":""}</span>`:""}
     </div>
@@ -2151,6 +2152,7 @@ function teamRender(){
         }${m.state!=="working"?"":(m.heartbeat_age>=0
           ?` <span class="hb"${m.stale?" data-stale=\"1\"":""}>· 心跳 ${fmtDur(m.heartbeat_age)} 前</span>`
           :` <span class="hb" data-stale="1">· 无心跳</span>`)}</div>
+        ${m.last_write&&m.last_write.age_sec>=0?`<div class="r" style="margin-top:2px;${m.producing?"":"color:var(--amber)"}" title="这一轮最后一次真的写到磁盘是什么时候（服务端 stat 出来的 mtime，不是自报）">落盘 ${fmtDur(m.last_write.age_sec)}前${m.last_write.path?` · ${esc(String(m.last_write.path).split("/").pop())}`:""}${m.producing?"":" ⚠ 空转"}</div>`:""}
         <div class="util${(m.util_pct||0)<20?" low":""}" title="利用率 = 真实计时工时 ÷ 项目已流逝时间">
           <span>利用率</span><span class="ub"><i style="width:${Math.min(100,m.util_pct||0)}%"></i></span>
           <b>${m.util_pct||0}%</b></div>

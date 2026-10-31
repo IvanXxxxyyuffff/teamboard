@@ -3,7 +3,7 @@
 TeamBoard v2 — 项目看板 / 团队状态 / 交付物清单 / 进度报告
 零依赖（Python 标准库 + SQLite）。启动：python3 server.py --port 8787
 """
-import argparse, glob, json, os, re, sqlite3, subprocess, sys, time, uuid
+import argparse, glob, json, os, re, sqlite3, subprocess, sys, threading, time, uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
@@ -168,6 +168,7 @@ TASK_FIELDS = ("title", "detail", "role", "assignee_id", "status", "priority",
                "progress", "blocked_reason", "milestone", "resource", "evidence",
                "due_at", "evidence_path", "abandoned_reason",
                "verify_cmd", "verify_out", "verified_at",
+               "pace_min",
                # 断点：换人/重启后先读它，不许从头来
                "checkpoint", "checkpoint_at")
 EVIDENCE = ("observed", "inferred", "assumed")
@@ -300,6 +301,14 @@ def init_db():
             ("tasks", "verify_out", "TEXT DEFAULT ''"),      # 实测输出（≤5 行），没有就是空
             ("tasks", "verified_at", "TEXT DEFAULT ''"),     # 这条证据是什么时候跑的
             ("tasks", "abandoned_reason", "TEXT DEFAULT ''"),# 放弃原因，换人接手时最值钱
+            # 落盘节奏：派单时定「每 N 分钟必须有一次文件变动」。
+            # 进程活没活 ≠ 有没有产出；心跳再勤，文件不动也等于空转。
+            ("tasks", "pace_min", "INTEGER DEFAULT 20"),
+            ("tasks", "spin_alert_at", "REAL DEFAULT 0"),     # 上一次空转告警时刻（同一条任务 30 分钟只喊一次）
+            # 心跳带落盘指纹：由服务端 stat 文件得到，不采信调用方自报的 mtime
+            ("members", "last_write_path", "TEXT DEFAULT ''"),
+            ("members", "last_write_mtime", "REAL DEFAULT 0"),
+            ("members", "last_write_bytes", "INTEGER DEFAULT 0"),
             ("members", "is_lead", "INTEGER DEFAULT 0"),  # 总监不计入员工编制
             ("projects", "goal_criteria", "TEXT DEFAULT ''"),
             ("projects", "workdir", "TEXT DEFAULT ''"),
@@ -476,6 +485,66 @@ def check_deliverables(base, spec):
         return True, True, []
     flags = [deliverable_exists(base, q) for q in paths]
     return all(flags), any(flags), [q for q, ok in zip(paths, flags) if not ok]
+
+
+def path_mtime(path):
+    """最近一次「文件真的变了」的时刻。
+
+    目录取一级子文件的最大 mtime：任务写的是 outputs/，产物却是 outputs/a.md、
+    outputs/b.png，只看目录本身的 mtime 会被「新增一个文件」骗成「刚写过」。
+    """
+    try:
+        if os.path.isfile(path):
+            st = os.stat(path)
+            return st.st_mtime, st.st_size
+        if os.path.isdir(path):
+            newest, size = 0.0, 0
+            with os.scandir(path) as it:
+                for e in it:
+                    try:
+                        if not e.is_file():
+                            continue
+                        s = e.stat()
+                        if s.st_mtime > newest:
+                            newest, size = s.st_mtime, s.st_size
+                    except OSError:
+                        continue
+            if newest:
+                return newest, size
+            st = os.stat(path)
+            return st.st_mtime, 0
+    except OSError:
+        return 0.0, 0
+    return 0.0, 0
+
+
+def write_fingerprint(base, spec):
+    """交付物 → (路径, mtime, 字节数)。取存在项里最新的那个。"""
+    best = ("", 0.0, 0)
+    for q in parse_deliverables(spec):
+        p = q if os.path.isabs(q) else os.path.join(base or "", q)
+        mt, sz = path_mtime(p)
+        if mt > best[1]:
+            best = (q, mt, sz)
+    return best
+
+
+def run_verify(cmd, cwd, timeout=120):
+    """跑一遍 verify_cmd，返回 (退出码, 输出尾巴)。
+
+    不采信「我自己跑过了」：文档写了但没落盘、命令写了但没跑，都是谎报。
+    退出码才是唯一可信的通过判定；输出只留最后几行给卡片/接口用。
+    """
+    timeout = max(5, min(int(timeout or 120), 600))
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                           timeout=timeout, cwd=(cwd or None))
+        out = ((p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")).strip()
+        return int(p.returncode), out[-800:]
+    except subprocess.TimeoutExpired:
+        return 124, f"超时（>{timeout}s）"
+    except Exception as e:                       # noqa: BLE001
+        return 1, f"执行失败：{e}"
 
 
 _PROC_CACHE = {"at": 0.0, "map": {}}
@@ -1532,6 +1601,13 @@ SESSION_SILENT_SEC = 90
 # 索引覆盖的天数。只扫 2 天会漏掉「三天前开的、一直在写」的长会话——主线程
 # 恰好就是这种：文件在 10-27 的目录里，写到今天，于是永远查不到、永远显示离线。
 SESSION_INDEX_DAYS = 10
+# 落盘指纹的判定窗。进程活着不等于在产出：一个 agent 可以挂着 doing、
+# 心跳每分钟一次、文件 40 分钟没动过。10 分钟是「还在写这一版」的合理上限。
+PRODUCING_SEC = 600
+# 后台巡检节奏（秒）。看板不等用户开口：每 2 分钟扫一遍 doing 任务的交付物 mtime，
+# 超过 pace_min 没动就落一条 task.spin 事件，谁接手都能看见「这段在空转」。
+SWEEP_SEC = int(os.environ.get("TEAMBOARD_SWEEP_SEC") or 120)
+SPIN_EVENT_GAP = 1800
 # 全员停摆阈值。总监的默认行为是「自己埋头干」，不回头看工位，
 # 于是 4 个员工全停了他也不知道。15 分钟是这个尺度的上限：
 # 短于 15 分钟可能只是某条命令跑得久（90 秒静默窗会让它短暂掉线），
@@ -2622,6 +2698,18 @@ def project_state(pid):
         m["blocked_title"] = blocked[0]["title"] if blocked else ""
         m["blocked_reason"] = (blocked[0].get("blocked_reason") or "") if blocked else ""
         m["thread_id"] = (m.get("thread_id") or "").strip()
+        # 落盘指纹：进程活没活是一回事，文件动没动是另一回事。
+        # 「工作中」但 40 分钟没落过一个字节，那就是空转——这一列比利用率更硬。
+        _lwm = float(m.get("last_write_mtime") or 0)
+        _lw_age = max(0, int(now - _lwm)) if _lwm > 0 else -1
+        m["last_write"] = {"path": m.get("last_write_path") or "",
+                           "age_sec": _lw_age,
+                           "age_human": _hm(_lw_age) if _lw_age >= 0 else "",
+                           "bytes": int(m.get("last_write_bytes") or 0)}
+        m["producing"] = bool(_lw_age >= 0 and _lw_age <= PRODUCING_SEC)
+        # 有会话还在跑就别再 spawn：同一个工位两个执行体 = 两份上下文、两份账单、
+        # 互相覆盖同一批文件。复用旧会话（followup_task / send_input）才是默认动作。
+        m["spawn_hint"] = ("reuse" if (m.get("session_live") or m["live"]) else "new")
         # 工位：员工身份是「椅子」，会话是坐在椅子上的人。换人不换椅子。
         m["seat_no"] = int(m.get("seat_no") or 0)
         m["seat_label"] = f"#{m['seat_no']:02d}" if m["seat_no"] else "#--"
@@ -2782,6 +2870,21 @@ def project_state(pid):
         t["stale_level"] = ("crit" if t["stale_sec"] >= 90 * 60
                             else "warn" if t["stale_sec"] >= 30 * 60 else "ok")
         t["estimate"] = safe_float(t.get("estimate"), 1) or 1
+        # 落盘节奏：doing 任务的交付物多久没变过。
+        # 这跟 stale_sec（任务行多久没更新）不是一回事：任务可以每 10 分钟报一次
+        # 进度 45%，文件却一小时没动——那 45% 是自评，不是产出。
+        t["pace_min"] = int(t.get("pace_min") or 0)
+        t["write_age_sec"] = -1
+        if paths:
+            _rel, _mt, _sz = write_fingerprint(workdir, dl)
+            if _mt > 0:
+                t["write_age_sec"] = max(0, int(now - _mt))
+        t["spinning"] = bool(
+            t["status"] == "doing" and t["pace_min"] > 0
+            and t["write_age_sec"] >= 0
+            and t["write_age_sec"] > t["pace_min"] * 60)
+        # 颗粒度：>2h 的活不拆，落盘频率必然低、空转也看不出来
+        t["split_hint"] = bool(t["estimate"] > 2 and t["status"] in ("backlog", "doing"))
 
     # 资源冲突：同一资源被两个 doing 任务同时占用
     res_use = {}
@@ -3310,12 +3413,32 @@ def project_state(pid):
                f"status='doing', assignee_id='{m0['id']}')",
                0, t0["id"], m0["id"])
     for t in open_tasks:
+        # 空转：任务挂着 doing、交付物超过自定的落盘节奏没变。
+        # 排在最前，因为它比「任务行多久没更新」更接近真相——
+        # 进度可以手填，mtime 不能。
+        if t.get("spinning"):
+            _nitem("spin", t.get("assignee") or "?",
+                   f"「{t['title'][:20]}」交付物 {_hm(t['write_age_sec'])}没动过"
+                   f"（自定节奏 {t['pace_min']} 分钟）",
+                   f"先 ls -la {t.get('deliverable') or '(未写交付物)'} 核实，"
+                   f"再决定：让他交一次中间产物 / 改派 / 转 blocked；"
+                   f"超过 {int(t['pace_min'])} 分钟没落盘的「进行中」不算进展",
+                   t["write_age_sec"], t["id"], t.get("assignee_id") or "")
+            continue
         if t["status"] == "doing" and t.get("stale_level") in ("warn", "crit"):
             _nitem("stalled", t.get("assignee") or "?",
                    f"「{t['title'][:20]}」{_hm(t.get('stale_sec') or 0)}没更新",
                    f"问一句卡在哪：update_task(task='{t['id']}', progress=…, blocked_reason=…) "
                    f"把卡点写回看板", t.get("stale_sec") or 0, t["id"], "")
             break
+    # 颗粒度：>2h 的活不拆，等于把「什么时候能看见产出」推迟到一个没人盯的时刻
+    big = [t for t in open_tasks if t.get("split_hint")]
+    if big:
+        t0 = big[0]
+        _nitem("split", t0.get("assignee") or "?",
+               f"「{t0['title'][:20]}」估时 {t0['estimate']:g}h，超 2h 没拆",
+               "拆成每段都有独立可验收产物的子任务：add_task(... pace_min=20)；"
+               "颗粒度小 = 落盘频率高 = 空转看得见", 0, t0["id"], t0.get("assignee_id") or "")
     if derail:
         _nitem("derail", "总监", f"{_hm(board_silent)}没碰过计划",
                "先 update_task 报一次真实进度，再谈新计划", board_silent, "", "")
@@ -3334,6 +3457,13 @@ def project_state(pid):
                f"醒得再勤，不看团队也等于没醒", 0, "", "")
 
     worst = max([x["age_sec"] for x in nudge_items] or [0])
+    # 落盘视角：这一屏里有几条在做实事、几条在空转。利用率是估的，mtime 是事实。
+    _trk = [t for t in tasks if t["status"] == "doing" and t.get("deliverable_paths")]
+    writing = {"tracked": len(_trk),
+               "producing": len([t for t in _trk
+                                 if 0 <= t.get("write_age_sec", -1) <= PRODUCING_SEC]),
+               "spinning": len([t for t in _trk if t.get("spinning")]),
+               "no_fingerprint": len([t for t in _trk if t.get("write_age_sec", -1) < 0])}
     nudge_level = ("shout" if (idle_alert or not align["ok"] or need_ack_list)
                    else ("warn" if nudge_items else "ok"))
     nudge = {"level": nudge_level, "count": len(nudge_items),
@@ -3348,6 +3478,7 @@ def project_state(pid):
                         if nudge_items else {})}
     last_any = max([float(m.get("last_alive") or 0) for m in members] or [0])
     return {"project": dict(p), "members": members, "tasks": tasks, "stats": stats,
+            "writing": writing,
             "resume": {"orphans": len(orphans),
                        "not_working": len([m for m in members if m["state"] != "working"]),
                        "total": len(members),
@@ -3536,7 +3667,7 @@ def ensure_seats(pid=None):
                           " WHERE id=?", (ts, r["id"], r["id"]))
 
 
-def bind_member(pid, mid, thread_id, reason="", host_pid=0, host_boot=""):
+def bind_member(pid, mid, thread_id, reason="", host_pid=0, host_boot="", force=False):
     """接管工位：换会话，不换人。
 
     子代理被关闭、重开一个新的，只是换了一段执行会话：
@@ -3562,6 +3693,23 @@ def bind_member(pid, mid, thread_id, reason="", host_pid=0, host_boot=""):
         if old == thread_id:
             return {"ok": True, "id": mid, "name": m["name"], "thread_id": thread_id,
                     "seat_no": int(m["seat_no"] or 0), "bind_count": binds, "unchanged": True}
+        # 复用优先：旧会话还在跑的时候再 spawn 一个，等于同一个工位两个执行体，
+        # 两份上下文、两份账单，还会互相覆盖同一批文件。默认拒绝，强制才放行。
+        if old and not force:
+            _p = session_path_of(old)
+            if _p:
+                try:
+                    _age = time.time() - os.path.getmtime(_p)
+                except OSError:
+                    _age = 1e9
+                _tail = (session_tail(_p) or {}).get("type") or ""
+                if _age < SESSION_SILENT_SEC and _tail in BUSY_TAIL:
+                    return {"error": f"这个工位上的会话还在跑（{int(_age)} 秒前还在写，"
+                                     f"尾部事件 {_tail}）。先 send_input/followup_task 复用它，"
+                                     "确实要换执行体再带 force=true",
+                            "field": "thread_id", "need_reuse": True,
+                            "old_thread": old, "old_tail": _tail,
+                            "old_idle_sec": int(_age)}
         now = time.time()
         c.execute("UPDATE member_threads SET released_at=?"
                   " WHERE member_id=? AND released_at IS NULL", (now, mid))
@@ -4133,11 +4281,23 @@ def update_task(tid, b):
                         "field": "verify_cmd", "need_evidence": True,
                         "hint": "纯人工判断确实没有命令的，带 force=true；看板会把它算进「无证据完成」"}
             b.setdefault("verify_cmd", vc)
+            # 插件自己跑一遍：写了命令却跑不过，就不许标完成。
+            # 「文档写了但没落盘」「命令写了但没跑」这类谎报，只有退出码拆得穿。
+            if not b.get("skip_verify") and os.environ.get("TEAMBOARD_AUTO_VERIFY", "1") != "0":
+                rc, out = run_verify(vc, project_workdir(t["project_id"]),
+                                     b.get("verify_timeout") or 120)
+                if rc != 0:
+                    return {"error": f"verify_cmd 跑不过（exit {rc}）：{out[-300:]}",
+                            "field": "verify_cmd", "need_verify_pass": True,
+                            "exit": rc, "output": out[-800:]}
+                # 证据由插件生成：留下的是这次真实回显，不是调用方自己贴的
+                b["verify_out"] = "\n".join((out or "").splitlines()[:5])[:600] or "exit 0"
+            else:
+                vo = (b.get("verify_out") or "").strip()
+                if vo:
+                    # 输出只留 5 行：日志全文去 evidence_path 里找，卡片上要的是结论
+                    b["verify_out"] = "\n".join(vo.splitlines()[:5])[:600]
             b.setdefault("verified_at", now_iso())
-            vo = (b.get("verify_out") or "").strip()
-            if vo:
-                # 输出只留 5 行：日志全文去 evidence_path 里找，卡片上要的是结论
-                b["verify_out"] = "\n".join(vo.splitlines()[:5])[:600]
         # 交付物必须真实存在，才允许标记完成
         if st == "done":
             dl = (b.get("deliverable") or t["deliverable"] or "").strip()
@@ -4573,7 +4733,8 @@ def update_member(mid, b):
         with db() as c:
             row = c.execute("SELECT project_id FROM members WHERE id=?", (mid,)).fetchone()
         if row:
-            r = bind_member(row["project_id"], mid, b["thread_id"], b.get("reason", ""))
+            r = bind_member(row["project_id"], mid, b["thread_id"], b.get("reason", ""),
+                            force=bool(b.get("force")))
             if "error" in r:
                 return r
             b = {k: v for k, v in b.items() if k != "thread_id"}
@@ -4641,9 +4802,32 @@ def heartbeat(mid, b=None):
         if hp > 0:
             sets += ["host_pid=?", "host_boot=?", "dead_reason=''"]
             vals += [hp, boot]
+        # 落盘指纹：这一轮到底有没有东西落到磁盘上。
+        # 传了 path（或 paths）就由服务端 stat，记的是文件的真实 mtime；
+        # 没传就沿用上一次的指纹——「没报」不等于「刚写过」。
+        raw_p = b.get("paths") if isinstance(b.get("paths"), list) else b.get("path")
+        spec = "|".join(str(x) for x in raw_p) if isinstance(raw_p, list) else (raw_p or "")
+        wrote = None
+        if (spec or "").strip():
+            rel, mt, sz = write_fingerprint(project_workdir(row["project_id"]), spec)
+            if mt > 0:
+                sets += ["last_write_path=?", "last_write_mtime=?", "last_write_bytes=?"]
+                vals += [rel, mt, sz]
+                wrote = {"path": rel, "age_sec": max(0, int(ts - mt)), "bytes": sz}
+            else:
+                wrote = {"path": spec, "age_sec": -1, "bytes": 0, "missing": True}
         c.execute(f"UPDATE members SET {','.join(sets)} WHERE id=?", vals + [mid])
-    return {"ok": True, "id": mid, "ts": now_iso(),
-            "host_alive": alive}
+        lw = c.execute("SELECT last_write_path, last_write_mtime, last_write_bytes"
+                       " FROM members WHERE id=?", (mid,)).fetchone()
+    out = {"ok": True, "id": mid, "ts": now_iso(), "host_alive": alive}
+    if lw and float(lw["last_write_mtime"] or 0) > 0:
+        age = max(0, int(ts - float(lw["last_write_mtime"])))
+        out["last_write"] = {"path": lw["last_write_path"], "age_sec": age,
+                             "bytes": int(lw["last_write_bytes"] or 0),
+                             "producing": age <= PRODUCING_SEC}
+    if wrote and wrote.get("missing"):
+        out["last_write"] = {"path": wrote["path"], "missing": True}
+    return out
 
 
 def heartbeat_project(pid, b):
@@ -4696,8 +4880,24 @@ def heartbeat_project(pid, b):
             # 总监的宿主进程：Codex 一退，这条 pid 就没了，总监当场显示断线
             c.execute("UPDATE members SET host_pid=?, host_boot=? WHERE id=?",
                       (hp, b.get("host_boot") or proc_boot(hp), lead["id"]))
-    return {"ok": True, "project_id": pid, "touched": hit,
-            "unknown": unknown, "ts": now_iso()}
+        # 落盘指纹记在总监头上（这条接口是总监自报），子代理用单人心跳带自己的 path
+        lw = None
+        raw_p = b.get("paths") if isinstance(b.get("paths"), list) else b.get("path")
+        spec = "|".join(str(x) for x in raw_p) if isinstance(raw_p, list) else (raw_p or "")
+        if (spec or "").strip():
+            tgt = (lead["id"] if lead else (hit[0] if hit else ""))
+            rel, mt, sz = write_fingerprint(project_workdir(pid), spec)
+            if tgt and mt > 0:
+                c.execute("UPDATE members SET last_write_path=?, last_write_mtime=?,"
+                          " last_write_bytes=? WHERE id=?", (rel, mt, sz, tgt))
+                lw = {"path": rel, "age_sec": 0, "bytes": sz, "producing": True}
+            elif spec.strip():
+                lw = {"path": spec, "missing": True}
+    out = {"ok": True, "project_id": pid, "touched": hit,
+           "unknown": unknown, "ts": now_iso()}
+    if lw:
+        out["last_write"] = lw
+    return out
 
 
 def set_duty(mid, b):
@@ -5397,6 +5597,49 @@ def _safe_stdio():
             pass
 
 
+def sweep_spin():
+    """主动巡检：不等任何人开口，按 pace_min 找空转的 doing 任务。
+
+    看板只回答「谁在做什么」是不够的——任务可以挂着 doing 四十分钟，
+    进度手填 45%，文件一个字节没动。这里按交付物的真实 mtime 判，
+    超过自定节奏就落一条 task.spin 事件（同一任务 30 分钟只记一次）。
+    """
+    now = time.time()
+    hits = 0
+    with db() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM tasks WHERE status='doing' AND pace_min>0"
+            " AND TRIM(COALESCE(deliverable,''))<>''")]
+    for t in rows:
+        _rel, mt, _sz = write_fingerprint(project_workdir(t["project_id"]),
+                                          t["deliverable"])
+        if mt <= 0:
+            continue
+        age = now - mt
+        if age <= int(t["pace_min"]) * 60:
+            continue
+        if now - float(t.get("spin_alert_at") or 0) < SPIN_EVENT_GAP:
+            continue
+        with db() as c:
+            c.execute("UPDATE tasks SET spin_alert_at=? WHERE id=?", (now, t["id"]))
+            log_event(c, t["project_id"], "task.spin",
+                      actor=t.get("assignee_id") or "",
+                      payload=f"{t['title'][:40]} 交付物 {int(age / 60)} 分钟没动"
+                              f"（pace {t['pace_min']}m）")
+        hits += 1
+    return hits
+
+
+def _sweep_loop():
+    while True:
+        time.sleep(SWEEP_SEC)
+        try:
+            sweep_spin()
+        except Exception:                        # noqa: BLE001
+            # 巡检失败不能拖垮服务：下一轮再来
+            pass
+
+
 def main():
     _safe_stdio()
     global DB_PATH
@@ -5412,6 +5655,7 @@ def main():
     init_db()
     ensure_seats()          # 老库补工位号：编制要能一眼看出「谁是谁」
     backfill_sessions()
+    threading.Thread(target=_sweep_loop, daemon=True).start()
     srv = Board((a.host, a.port), Handler)
     try:
         srv.serve_forever()
